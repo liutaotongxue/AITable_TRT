@@ -1,0 +1,30 @@
+# Core dependencies
+numpy>=1.19.0,<2.0.0
+opencv-python>=4.5.0,<5.0.0
+Pillow>=8.0.0,<11.0.0
+scipy>=1.5.0,<2.0.0
+
+# GUI
+# tkinter is included with Python
+
+# Logging
+colorlog>=6.0.0
+
+# Image processing
+scikit-image>=0.18.0
+
+# Optional: Deep learning (uncomment if needed)
+# torch>=1.9.0
+# torchvision>=0.10.0
+# onnx>=1.10.0
+# onnxruntime>=1.8.0
+
+# Optional: Data analysis (uncomment if needed)
+# pandas>=1.3.0
+# matplotlib>=3.3.0
+
+# Development tools (optional)
+# pytest>=6.0.0
+# black>=21.0
+# flake8>=3.9.0
+# mypy>=0.900

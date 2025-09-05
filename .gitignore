@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.pyo
+*.pyc
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.claude/
+
+# Logs
+*.log
+logs/
+Mv3dRgbdLog/
+
+# System
+.DS_Store
+Thumbs.db
+nul
+
+# Test files
+test_*.py
+*_test.py
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# Models (large files)
+models/*.pth
+models/*.onnx
+models/*.pkl
+
+# Data
+data/
+output/
+results/
