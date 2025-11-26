@@ -46,15 +46,20 @@ class EnhancedVisualizer:
     def draw_visualization(self, image: np.ndarray, results: Dict, model_info: str = "YOLOv8n-Face") -> np.ndarray:
         """
         绘制可视化效果 ，增强显示
-        
+
         参数:
             image: 输入图像
             results: 检测结果字典
             model_info: 模型信息字符串
-        
+
         返回:
             带有可视化效果的图像
         """
+        # 检查 LOST 状态：主角暂时丢失时不画旧框，直接显示"No Face Detected"
+        quality = results.get('quality', '') if results else ''
+        if quality and quality.lower() == 'lost':
+            return self.draw_no_detection(image, model_info)
+
         # 如果没有检测结果，显示无检测画面
         if not results or not results.get('detection'):
             return self.draw_no_detection(image, model_info)
@@ -68,28 +73,56 @@ class EnhancedVisualizer:
         emotion_enabled = results.get('emotion_enabled', False)  # 情绪识别是否启用
         fatigue = results.get('fatigue')  # 疲劳检测结果
         fatigue_enabled = results.get('fatigue_enabled', False)  # 疲劳检测是否启用
+        pose = results.get('pose')  # 姿态检测结果
+        pose_enabled = results.get('pose_enabled', False)  # 姿态检测是否启用
         
-        # 1. 绘制人脸边框 
+        # 1. 绘制检测框（质量感知）
         bbox = detection['bbox']
-        # 深度可用时为绿色，否则为橙色
-        color = (0, 255, 0) if depth_available else (0, 165, 255)
+        bbox_type = detection.get('bbox_type', 'face')  # 默认为 face
+        quality = detection.get('quality', None)
+
+        # 根据 bbox 类型和质量选择颜色和标签
+        if bbox_type == 'person' or quality == 'BODY_ONLY':
+            # BODY_ONLY 模式：黄色人体框
+            color = (0, 255, 255)  # 黄色
+            label = "BODY"
+        else:
+            # FULL/FACE_ONLY 模式：深度可用时为绿色，否则为橙色
+            color = (0, 255, 0) if depth_available else (0, 165, 255)
+            label = "FACE"
+
         cv2.rectangle(image, (bbox['x1'], bbox['y1']), (bbox['x2'], bbox['y2']), color, 2)
-        
-        # 2. 绘制眼睛位置标记 
-        # 左眼：深度可用时为蓝色，否则为灰色
-        left_eye_color = (255, 0, 0) if depth_available else (128, 128, 128)
-        # 右眼：深度可用时为绿色，否则为灰色
-        right_eye_color = (0, 255, 0) if depth_available else (128, 128, 128)
-        
-        # 绘制眼睛圆点
-        cv2.circle(image, detection['left_eye'], 8, left_eye_color, -1)
-        cv2.circle(image, detection['right_eye'], 8, right_eye_color, -1)
-        
-        # 眼睛标签（L表示左眼，R表示右眼）
-        cv2.putText(image, "L", (detection['left_eye'][0]-15, detection['left_eye'][1]-15),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, left_eye_color, 2)
-        cv2.putText(image, "R", (detection['right_eye'][0]-15, detection['right_eye'][1]-15),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, right_eye_color, 2)
+
+        # 在 bbox 左上角显示类型标签
+        cv2.putText(image, label, (bbox['x1'], bbox['y1'] - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # 2. 绘制眼睛位置标记（仅在有眼睛数据时）
+        left_eye = detection.get('left_eye')
+        right_eye = detection.get('right_eye')
+
+        if left_eye is not None and right_eye is not None:
+            # 左眼：深度可用时为蓝色，否则为灰色
+            left_eye_color = (255, 0, 0) if depth_available else (128, 128, 128)
+            # 右眼：深度可用时为绿色，否则为灰色
+            right_eye_color = (0, 255, 0) if depth_available else (128, 128, 128)
+
+            # 绘制眼睛圆点
+            cv2.circle(image, left_eye, 8, left_eye_color, -1)
+            cv2.circle(image, right_eye, 8, right_eye_color, -1)
+
+            # 眼睛标签（L表示左眼，R表示右眼）
+            cv2.putText(image, "L", (left_eye[0]-15, left_eye[1]-15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, left_eye_color, 2)
+            cv2.putText(image, "R", (right_eye[0]-15, right_eye[1]-15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, right_eye_color, 2)
+        else:
+            # BODY_ONLY 模式：在 bbox 中心绘制一个标记表示追踪中心
+            cx = (bbox['x1'] + bbox['x2']) // 2
+            cy = (bbox['y1'] + bbox['y2']) // 2
+            cv2.circle(image, (cx, cy), 10, (0, 255, 255), 2)  # 黄色空心圆
+            cv2.putText(image, "C", (cx - 10, cy - 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
         # 3. 主要距离显示 
         if distance and depth_available:
@@ -107,8 +140,12 @@ class EnhancedVisualizer:
         # 6. 疲劳检测结果显示
         if fatigue_enabled and fatigue and fatigue.get('enabled', False):
             self.draw_fatigue_info(image, fatigue, detection)
-        
-        # 7. 性能信息显示 - 保持原始风格
+
+        # 7. 姿态检测结果显示（骨骼连线和角度）
+        if pose_enabled and pose:
+            self.draw_pose_info(image, pose, detection)
+
+        # 8. 性能信息显示 - 保持原始风格
         self.draw_performance_info(image, results)
         
         return image
@@ -168,12 +205,12 @@ class EnhancedVisualizer:
     def draw_english_info_panel(self, image: np.ndarray, results: Dict, model_info: str, raw_distance: Optional[float]):
         """
         绘制英文信息面板 - 新功能
-        
+
         参数:
             image: 输入图像
             results: 检测结果
             model_info: 模型信息
-            raw_distance: 原始深度距离
+            raw_distance: 眼睛到桌面距离（米）
         """
         h, w = image.shape[:2]
         
@@ -210,18 +247,6 @@ class EnhancedVisualizer:
         status_text = "Status: RUNNING" if results.get('depth_available') else "Status: NO DEPTH"
         cv2.putText(image, status_text, (panel_x + 10, panel_y + 175),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2)
-        
-        # 左下角深度信息 
-        if raw_distance:
-            depth_info_y = h - 80
-            cv2.putText(image, f"Raw Depth: {raw_distance:.3f}m", (20, depth_info_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-            cv2.putText(image, "Depth Status: DEPTH OK", (20, depth_info_y + 35),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-        else:
-            depth_info_y = h - 50
-            cv2.putText(image, "Depth Status: NO DEPTH", (20, depth_info_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
     
     def draw_no_depth_warning(self, image: np.ndarray):
         """
@@ -283,36 +308,40 @@ class EnhancedVisualizer:
     
     def draw_emotion_info(self, image: np.ndarray, emotion: Dict, detection: Dict):
         """
-        绘制情绪识别结果
-        
+        绘制情绪识别结果（左侧中间位置）
+
         参数:
             image: 输入图像
             emotion: 情绪识别结果字典
             detection: 人脸检测结果字典
         """
         h, w = image.shape[:2]
-        
-        # 情绪信息面板位置 - 左上角 
+
+        # 情绪信息面板位置 - 左侧中间
         panel_x = 20
-        panel_y = 120
-        panel_width = 330
-        panel_height = 180
-        
+        panel_width = 280
+        panel_height = 160
+        panel_y = (h - panel_height) // 2  # 垂直居中
+
         # 绘制半透明背景
         overlay = image.copy()
-        cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_width, panel_y + panel_height), 
+        cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_width, panel_y + panel_height),
                      (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
-        
-        # 面板标题 
-        cv2.putText(image, "Emotion Analysis", (panel_x + 10, panel_y + 35),
+
+        # 面板边框
+        cv2.rectangle(image, (panel_x, panel_y), (panel_x + panel_width, panel_y + panel_height),
+                     (100, 100, 100), 1)
+
+        # 面板标题
+        cv2.putText(image, "EMOTION", (panel_x + 10, panel_y + 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
+
         # 获取情绪结果
         emotion_name = emotion.get('emotion', 'Unknown')
         valence = emotion.get('valence', 0.0)  # 情绪效价（正负情绪）
         arousal = emotion.get('arousal', 0.0)  # 情绪唤醒度（激动程度）
-        
+
         # 情绪颜色映射
         emotion_colors = {
             'Happy': (0, 255, 0),      # 绿色 - 开心
@@ -332,19 +361,19 @@ class EnhancedVisualizer:
             'Neutral': (255, 255, 255), # 白色 - 中性
             'neutral': (255, 255, 255)
         }
-        
+
         # 获取对应的颜色
         emotion_color = emotion_colors.get(emotion_name, (255, 255, 255))
-        
-        # 显示情绪类型 
-        cv2.putText(image, f"Emotion: {emotion_name}", (panel_x + 10, panel_y + 75),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, emotion_color, 2)
-        
-        # 显示效价和唤醒度 
-        cv2.putText(image, f"Valence: {valence:.2f}", (panel_x + 10, panel_y + 115),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(image, f"Arousal: {arousal:.2f}", (panel_x + 10, panel_y + 150),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        # 显示情绪类型（大字体突出显示）
+        cv2.putText(image, emotion_name, (panel_x + 10, panel_y + 75),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, emotion_color, 2)
+
+        # 显示效价和唤醒度
+        cv2.putText(image, f"Valence: {valence:+.2f}", (panel_x + 10, panel_y + 110),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        cv2.putText(image, f"Arousal: {arousal:+.2f}", (panel_x + 10, panel_y + 140),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
     
     def draw_no_detection(self, image: np.ndarray, model_info: str) -> np.ndarray:
         """
@@ -389,10 +418,306 @@ class EnhancedVisualizer:
         
         return image
     
+    def draw_pose_info(self, image: np.ndarray, pose, detection: Dict):
+        """
+        绘制姿态检测结果（关键点和骨骼连线）
+
+        绘制内容:
+        - 左肩-左眼-鼻子-右眼-右肩的连线
+        - 关键点圆圈
+        - 姿态角度信息面板
+
+        参数:
+            image: 输入图像
+            pose: 姿态检测结果（支持 dict 或 list 格式）
+            detection: 人脸检测结果字典（用于多人场景下匹配正确的姿态）
+        """
+        if not pose:
+            return
+
+        h, w = image.shape[:2]
+
+        # 格式兼容：如果 pose 是 list，转换为 dict 格式
+        if isinstance(pose, list):
+            pose = {'detections': pose} if pose else {}
+
+        # 提取关键点数据
+        # 支持两种数据格式:
+        # 1. TRTPoseDetector 格式: pose['detections'][...]['keypoints']
+        # 2. PoseEngine 格式: pose['keypoints_2d']
+        keypoints = {}
+        angles = pose.get('angles', {}) if isinstance(pose, dict) else {}
+
+        if isinstance(pose, dict) and 'detections' in pose and pose['detections']:
+            # TRTPoseDetector 格式 - 多人场景下选择与人脸最匹配的检测
+            detections = pose['detections']
+            best_det = self._find_best_matching_pose(detections, detection)
+
+            if best_det is None:
+                return
+
+            kps = best_det.get('keypoints', [])
+
+            # YOLO Pose COCO 17-keypoint indices
+            # 0: nose, 1: left_eye, 2: right_eye, 5: left_shoulder, 6: right_shoulder
+            keypoint_map = {
+                0: 'nose',
+                1: 'left_eye',
+                2: 'right_eye',
+                5: 'left_shoulder',
+                6: 'right_shoulder'
+            }
+
+            for kp in kps:
+                idx = kp.get('index', -1)
+                if idx in keypoint_map and kp.get('confidence', 0) > 0.3:
+                    keypoints[keypoint_map[idx]] = {
+                        'x': int(kp['x']),
+                        'y': int(kp['y']),
+                        'confidence': kp['confidence']
+                    }
+
+        elif isinstance(pose, dict) and 'keypoints_2d' in pose:
+            # PoseEngine 格式
+            # 注意: PoseEngine 使用 left_eye_center/right_eye_center 而不是 left_eye/right_eye
+            name_mapping = {
+                'left_eye_center': 'left_eye',
+                'right_eye_center': 'right_eye',
+            }
+            kps_2d = pose['keypoints_2d']
+            for name, coords in kps_2d.items():
+                if coords and isinstance(coords, tuple) and len(coords) >= 2:
+                    # 统一命名
+                    display_name = name_mapping.get(name, name)
+                    keypoints[display_name] = {
+                        'x': int(coords[0]),
+                        'y': int(coords[1]),
+                        'confidence': 1.0
+                    }
+
+        if not keypoints:
+            return
+
+        # 定义骨骼连接: 左肩-左眼-鼻子-右眼-右肩
+        skeleton_connections = [
+            ('left_shoulder', 'left_eye'),
+            ('left_eye', 'nose'),
+            ('nose', 'right_eye'),
+            ('right_eye', 'right_shoulder')
+        ]
+
+        # 颜色定义
+        skeleton_color = (0, 255, 255)  # 黄色骨骼线
+        keypoint_colors = {
+            'nose': (0, 0, 255),         # 红色 - 鼻子
+            'left_eye': (255, 0, 0),     # 蓝色 - 左眼
+            'right_eye': (0, 255, 0),    # 绿色 - 右眼
+            'left_shoulder': (255, 165, 0),   # 橙色 - 左肩
+            'right_shoulder': (255, 0, 255)   # 紫色 - 右肩
+        }
+
+        # 绘制骨骼连线
+        for start_name, end_name in skeleton_connections:
+            if start_name in keypoints and end_name in keypoints:
+                start_pt = (keypoints[start_name]['x'], keypoints[start_name]['y'])
+                end_pt = (keypoints[end_name]['x'], keypoints[end_name]['y'])
+                cv2.line(image, start_pt, end_pt, skeleton_color, 2)
+
+        # 绘制关键点
+        for name, kp in keypoints.items():
+            color = keypoint_colors.get(name, (255, 255, 255))
+            center = (kp['x'], kp['y'])
+            cv2.circle(image, center, 6, color, -1)  # 实心圆
+            cv2.circle(image, center, 8, (255, 255, 255), 1)  # 白色边框
+
+        # 绘制姿态角度信息面板（如果有角度数据）
+        if angles:
+            self._draw_pose_angles_panel(image, angles)
+
+    def _find_best_matching_pose(self, detections: list, face_detection: Dict):
+        """
+        在多人姿态检测中找到与当前人脸最匹配的姿态
+
+        匹配策略:
+        1. 计算人脸框与每个姿态person框的IoU（交并比）
+        2. IoU >= 阈值时，使用复合评分排序（IoU优先 + 中心距离次级）
+        3. IoU 低于阈值，使用鼻子关键点距离作为备选
+
+        参数:
+            detections: 姿态检测列表
+            face_detection: 人脸检测结果字典
+
+        返回:
+            最匹配的姿态检测，如果没有匹配返回 None
+        """
+        IOU_THRESHOLD = 0.15  # IoU 下限阈值，低于此值视为无效重叠
+
+        if not detections:
+            return None
+
+        if len(detections) == 1:
+            return detections[0]
+
+        if not face_detection or 'bbox' not in face_detection:
+            # 没有人脸信息，返回第一个检测
+            return detections[0]
+
+        face_bbox = face_detection['bbox']
+        fx1, fy1 = face_bbox['x1'], face_bbox['y1']
+        fx2, fy2 = face_bbox['x2'], face_bbox['y2']
+        face_cx = (fx1 + fx2) / 2
+        face_cy = (fy1 + fy2) / 2
+
+        # 收集所有候选及其评分
+        candidates = []
+
+        for det in detections:
+            pose_bbox = det.get('bbox', {})
+
+            if pose_bbox:
+                px1 = pose_bbox.get('x1', 0)
+                py1 = pose_bbox.get('y1', 0)
+                px2 = pose_bbox.get('x2', 0)
+                py2 = pose_bbox.get('y2', 0)
+
+                # 计算 IoU
+                iou = self._calculate_iou(fx1, fy1, fx2, fy2, px1, py1, px2, py2)
+
+                # 计算中心距离（归一化）
+                pose_cx = (px1 + px2) / 2
+                pose_cy = (py1 + py2) / 2
+                center_dist = ((pose_cx - face_cx) ** 2 + (pose_cy - face_cy) ** 2) ** 0.5
+
+                # 检测置信度
+                confidence = det.get('confidence', 0.5)
+
+                candidates.append({
+                    'det': det,
+                    'iou': iou,
+                    'center_dist': center_dist,
+                    'confidence': confidence
+                })
+
+        # 筛选 IoU >= 阈值的候选
+        valid_candidates = [c for c in candidates if c['iou'] >= IOU_THRESHOLD]
+
+        if valid_candidates:
+            # 复合排序：IoU 优先（降序），中心距离次级（升序），置信度三级（降序）
+            valid_candidates.sort(key=lambda c: (-c['iou'], c['center_dist'], -c['confidence']))
+            return valid_candidates[0]['det']
+
+        # 备选方案：使用鼻子关键点距离
+        best_det = None
+        best_dist = float('inf')
+        for det in detections:
+            kps = det.get('keypoints', [])
+            for kp in kps:
+                if kp.get('index') == 0 and kp.get('confidence', 0) > 0.3:  # nose
+                    nose_x, nose_y = kp['x'], kp['y']
+                    dist = ((nose_x - face_cx) ** 2 + (nose_y - face_cy) ** 2) ** 0.5
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_det = det
+                    break
+
+        return best_det if best_det else detections[0]
+
+    @staticmethod
+    def _calculate_iou(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2) -> float:
+        """
+        计算两个矩形框的IoU（交并比）
+
+        参数:
+            ax1, ay1, ax2, ay2: 框A的坐标 (x1, y1, x2, y2)
+            bx1, by1, bx2, by2: 框B的坐标 (x1, y1, x2, y2)
+
+        返回:
+            IoU值 [0.0, 1.0]
+        """
+        # 计算交集
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+
+        inter_w = max(0, inter_x2 - inter_x1)
+        inter_h = max(0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+
+        if inter_area == 0:
+            return 0.0
+
+        # 计算并集
+        area_a = (ax2 - ax1) * (ay2 - ay1)
+        area_b = (bx2 - bx1) * (by2 - by1)
+        union_area = area_a + area_b - inter_area
+
+        if union_area <= 0:
+            return 0.0
+
+        return inter_area / union_area
+
+    def _draw_pose_angles_panel(self, image: np.ndarray, angles: Dict):
+        """
+        绘制姿态角度信息面板
+
+        参数:
+            image: 输入图像
+            angles: 角度字典 {head_forward_angle, shoulder_tilt_angle, head_roll_angle}
+        """
+        h, w = image.shape[:2]
+
+        # 面板位置 - 左下角
+        panel_x = 20
+        panel_y = h - 200
+        panel_width = 280
+        panel_height = 180
+
+        # 绘制半透明背景
+        overlay = image.copy()
+        cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_width, panel_y + panel_height),
+                     (40, 40, 40), -1)
+        cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
+
+        # 面板标题
+        cv2.putText(image, "Posture Angles", (panel_x + 10, panel_y + 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        # 分隔线
+        cv2.line(image, (panel_x, panel_y + 40), (panel_x + panel_width, panel_y + 40), (60, 60, 60), 1)
+
+        # 角度信息
+        y_offset = panel_y + 70
+        angle_items = [
+            ('Forward', angles.get('head_forward_angle'), '°'),
+            ('Shoulder Tilt', angles.get('shoulder_tilt_angle'), '°'),
+            ('Head Roll', angles.get('head_roll_angle'), '°')
+        ]
+
+        for label, value, unit in angle_items:
+            if value is not None:
+                # 根据角度值选择颜色
+                abs_val = abs(value)
+                if abs_val < 10:
+                    color = (0, 255, 0)  # 绿色 - 正常
+                elif abs_val < 20:
+                    color = (0, 255, 255)  # 黄色 - 轻微
+                else:
+                    color = (0, 0, 255)  # 红色 - 警告
+
+                text = f"{label}: {value:+.1f}{unit}"
+            else:
+                color = (128, 128, 128)
+                text = f"{label}: N/A"
+
+            cv2.putText(image, text, (panel_x + 15, y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            y_offset += 35
+
     def draw_fatigue_info(self, image: np.ndarray, fatigue: Dict, detection: Dict):
         """
         绘制疲劳检测结果信息面板
-        
+
         参数:
             image: 输入图像
             fatigue: 疲劳检测结果字典
@@ -498,7 +823,7 @@ class EnhancedVisualizer:
         fps = fatigue.get('fps', 0)
         cv2.putText(image, f"FPS: {fps:.1f}", (panel_x + 420, panel_y + 75),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
-    
+
     def draw_combined_visualization(self, frame: np.ndarray, results: Dict, fatigue_detector=None) -> np.ndarray:
         """
         绘制完整的可视化界面
@@ -574,7 +899,24 @@ if __name__ == "__main__":
             'window_progress': 100,
             'fps': 30.0
         },
-        'fatigue_enabled': True
+        'fatigue_enabled': True,
+        'pose': {
+            'detections': [{
+                'keypoints': [
+                    {'index': 0, 'x': 500, 'y': 250, 'confidence': 0.95},  # nose
+                    {'index': 1, 'x': 470, 'y': 240, 'confidence': 0.92},  # left_eye
+                    {'index': 2, 'x': 530, 'y': 240, 'confidence': 0.91},  # right_eye
+                    {'index': 5, 'x': 400, 'y': 350, 'confidence': 0.88},  # left_shoulder
+                    {'index': 6, 'x': 600, 'y': 350, 'confidence': 0.87},  # right_shoulder
+                ]
+            }],
+            'angles': {
+                'head_forward_angle': -5.2,
+                'shoulder_tilt_angle': 3.1,
+                'head_roll_angle': -1.5
+            }
+        },
+        'pose_enabled': True
     }
     
     # 绘制可视化

@@ -1,7 +1,14 @@
 """
-检测模块
+检测模块 - TensorRT-only 架构
 """
-from .face_detector import SimpleFaceDetector
 from .distance_processor import DistanceProcessor
+from .trt_face_detector import TRTFaceDetector
+from .trt_pose_detector import TRTPoseDetector
+from .roi_manager import ROIManager
 
-__all__ = ['SimpleFaceDetector', 'DistanceProcessor']
+__all__ = [
+    'DistanceProcessor',
+    'TRTFaceDetector',
+    'TRTPoseDetector',
+    'ROIManager',
+]

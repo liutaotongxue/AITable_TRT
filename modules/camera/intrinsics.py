@@ -3,116 +3,123 @@
 """
 import numpy as np
 import cv2
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Any
 from ctypes import pointer
 from ..core.logger import logger
-
-# 导入SDK定义
-import os
-import sys
-current_dir = os.path.dirname(os.path.abspath(__file__))
-camera_sdk_dir = os.path.join(os.path.dirname(os.path.dirname(current_dir)), 'camera')
-if camera_sdk_dir not in sys.path:
-    sys.path.insert(0, camera_sdk_dir)
-
-try:
-    from Mv3dRgbdImport.Mv3dRgbdDefine import (
-        MV3D_RGBD_CAMERA_PARAM, 
-        MV3D_RGBD_OK,
-        ParamType_Int
-    )  # type: ignore
-    from Mv3dRgbdImport.Mv3dRgbdApi import Mv3dRgbd  # type: ignore
-    CAMERA_API_AVAILABLE = True
-except (ImportError, RuntimeError):
-    # Create dummy classes for when camera is not available
-    class MV3D_RGBD_CAMERA_PARAM:
-        pass
-    
-    class Mv3dRgbd:
-        pass
-    
-    MV3D_RGBD_OK = 0
-    CAMERA_API_AVAILABLE = False
 
 
 class CameraIntrinsicsManager:
     """管理相机内参参数"""
     
-    def __init__(self, camera: Mv3dRgbd):
+    def __init__(self, camera, sdk_classes=None):
         """
         初始化内参管理器
-        
+
         Args:
-            camera: TOF相机实例
+            camera: TOF相机实例（已通过tof_sdk_loader加载SDK）
+            sdk_classes: SDK类字典，包含MV3D_RGBD_CAMERA_PARAM和MV3D_RGBD_OK
         """
         self.camera = camera
-        self.camera_available = CAMERA_API_AVAILABLE
-        
-        if not self.camera_available:
-            # Create default/dummy parameters when camera is not available
-            self.camera_params = None
-            self.rgb_intrinsics = None
-            self.depth_intrinsics = None
-            self.depth_to_rgb_extrinsics = None
-            return
-            
+
+        # 保存SDK类引用（用于类型注解和常量）
+        if sdk_classes:
+            self.MV3D_RGBD_CAMERA_PARAM = sdk_classes.get('MV3D_RGBD_CAMERA_PARAM')
+            self.MV3D_RGBD_OK = sdk_classes.get('MV3D_RGBD_OK', 0)
+        else:
+            # Dummy fallback（不应该发生，但保持健壮性）
+            self.MV3D_RGBD_CAMERA_PARAM = type('MV3D_RGBD_CAMERA_PARAM', (), {})
+            self.MV3D_RGBD_OK = 0
+            logger.warning("SDK classes not provided, using dummy fallback")
+
         # 获取相机参数
-        self.camera_params = self._get_camera_params()
+        try:
+            self.camera_params = self._get_camera_params()
+
+            # 解析内参
+            self.rgb_intrinsics = self._parse_rgb_intrinsics()
+            self.depth_intrinsics = self._parse_depth_intrinsics()
+            self.depth_to_rgb_extrinsics = self._parse_extrinsics()
+
+            # 当前分辨率下的内参（动态更新）
+            self.current_rgb_intrinsics = self.rgb_intrinsics.copy()
+            self.current_depth_intrinsics = self.depth_intrinsics.copy()
+
+            logger.info("Camera intrinsics initialized from SDK")
+            logger.info(f"RGB intrinsics: fx={self.rgb_intrinsics['fx']:.2f}, fy={self.rgb_intrinsics['fy']:.2f}, "
+                       f"cx={self.rgb_intrinsics['cx']:.2f}, cy={self.rgb_intrinsics['cy']:.2f}, "
+                       f"resolution={self.rgb_intrinsics['width']}x{self.rgb_intrinsics['height']}")
+            logger.info(f"Depth intrinsics: fx={self.depth_intrinsics['fx']:.2f}, fy={self.depth_intrinsics['fy']:.2f}, "
+                       f"cx={self.depth_intrinsics['cx']:.2f}, cy={self.depth_intrinsics['cy']:.2f}, "
+                       f"resolution={self.depth_intrinsics['width']}x{self.depth_intrinsics['height']}")
+        except Exception as e:
+            logger.error(f"Error parsing camera intrinsics: {e}, using default values")
+            # 如果解析失败，填充默认值，避免后续访问属性时报错
+            self.camera_params = None
+            self.rgb_intrinsics = {
+                'fx': 405.0, 'fy': 405.0, 'cx': 320.0, 'cy': 240.0,
+                'width': 640, 'height': 480
+            }
+            self.depth_intrinsics = {
+                'fx': 447.0, 'fy': 444.0, 'cx': 319.0, 'cy': 239.0,
+                'width': 640, 'height': 480
+            }
+            self.depth_to_rgb_extrinsics = np.eye(4)
+            self.current_rgb_intrinsics = self.rgb_intrinsics.copy()
+            self.current_depth_intrinsics = self.depth_intrinsics.copy()
         
-        # 解析内参
-        self.rgb_intrinsics = self._parse_rgb_intrinsics()
-        self.depth_intrinsics = self._parse_depth_intrinsics()
-        self.depth_to_rgb_extrinsics = self._parse_extrinsics()
-        
-        # 当前分辨率下的内参（动态更新）
-        self.current_rgb_intrinsics = self.rgb_intrinsics.copy()
-        self.current_depth_intrinsics = self.depth_intrinsics.copy()
-        
-        logger.info("Camera intrinsics initialized from SDK")
-        logger.info(f"RGB intrinsics: fx={self.rgb_intrinsics['fx']:.2f}, fy={self.rgb_intrinsics['fy']:.2f}, "
-                   f"cx={self.rgb_intrinsics['cx']:.2f}, cy={self.rgb_intrinsics['cy']:.2f}, "
-                   f"resolution={self.rgb_intrinsics['width']}x{self.rgb_intrinsics['height']}")
-        logger.info(f"Depth intrinsics: fx={self.depth_intrinsics['fx']:.2f}, fy={self.depth_intrinsics['fy']:.2f}, "
-                   f"cx={self.depth_intrinsics['cx']:.2f}, cy={self.depth_intrinsics['cy']:.2f}, "
-                   f"resolution={self.depth_intrinsics['width']}x{self.depth_intrinsics['height']}")
-        
-    def _get_camera_params(self) -> MV3D_RGBD_CAMERA_PARAM:
+    def _get_camera_params(self):
         """从SDK获取相机参数"""
-        stCameraParam = MV3D_RGBD_CAMERA_PARAM()
+        stCameraParam = self.MV3D_RGBD_CAMERA_PARAM()
         ret = self.camera.MV3D_RGBD_GetCameraParam(pointer(stCameraParam))
-        
-        if ret != MV3D_RGBD_OK:
+
+        if ret != self.MV3D_RGBD_OK:
             logger.warning(f"Failed to get camera params from SDK: {ret:#x}")
             # 返回默认参数作为备份
             return self._get_default_params()
-            
+
         logger.info("Successfully retrieved camera parameters from SDK")
         return stCameraParam
     
     def _parse_rgb_intrinsics(self) -> Dict[str, float]:
         """解析RGB相机内参"""
         intrinsics = self.camera_params.stRgbCalibInfo.stIntrinsic.fData
-        
+        width = self.camera_params.stRgbCalibInfo.nWidth
+        height = self.camera_params.stRgbCalibInfo.nHeight
+
+        # 如果 SDK 返回的分辨率为 0，使用默认值（老 SDK 兼容）
+        if width == 0 or height == 0:
+            logger.warning(f"SDK returned invalid RGB resolution: {width}x{height}, using default 640x480")
+            width = 640
+            height = 480
+
         return {
-            'fx': intrinsics[0],
-            'fy': intrinsics[4],
-            'cx': intrinsics[2],
-            'cy': intrinsics[5],
-            'width': self.camera_params.stRgbCalibInfo.nWidth,
-            'height': self.camera_params.stRgbCalibInfo.nHeight
+            'fx': intrinsics[0] if intrinsics[0] != 0 else 405.0,
+            'fy': intrinsics[4] if intrinsics[4] != 0 else 405.0,
+            'cx': intrinsics[2] if intrinsics[2] != 0 else 320.0,
+            'cy': intrinsics[5] if intrinsics[5] != 0 else 240.0,
+            'width': width,
+            'height': height
         }
     
     def _parse_depth_intrinsics(self) -> Dict[str, float]:
         """解析深度相机内参"""
         intrinsics = self.camera_params.stDepthCalibInfo.stIntrinsic.fData
-        
+        width = self.camera_params.stDepthCalibInfo.nWidth
+        height = self.camera_params.stDepthCalibInfo.nHeight
+
+        # 如果 SDK 返回的分辨率为 0，使用默认值（老 SDK 兼容）
+        if width == 0 or height == 0:
+            logger.warning(f"SDK returned invalid Depth resolution: {width}x{height}, using default 640x480")
+            width = 640
+            height = 480
+
         return {
-            'fx': intrinsics[0],
-            'fy': intrinsics[4],
-            'cx': intrinsics[2],
-            'cy': intrinsics[5],
-            'width': self.camera_params.stDepthCalibInfo.nWidth,
-            'height': self.camera_params.stDepthCalibInfo.nHeight
+            'fx': intrinsics[0] if intrinsics[0] != 0 else 447.0,
+            'fy': intrinsics[4] if intrinsics[4] != 0 else 444.0,
+            'cx': intrinsics[2] if intrinsics[2] != 0 else 319.0,
+            'cy': intrinsics[5] if intrinsics[5] != 0 else 239.0,
+            'width': width,
+            'height': height
         }
     
     def _parse_extrinsics(self) -> np.ndarray:
@@ -120,9 +127,9 @@ class CameraIntrinsicsManager:
         extrinsics = self.camera_params.stDepth2RgbExtrinsic.fData
         return np.array(extrinsics).reshape((4, 4))
     
-    def _get_default_params(self) -> MV3D_RGBD_CAMERA_PARAM:
+    def _get_default_params(self):
         """获取默认参数（备用）"""
-        params = MV3D_RGBD_CAMERA_PARAM()
+        params = self.MV3D_RGBD_CAMERA_PARAM()
         
         # RGB默认内参
         params.stRgbCalibInfo.nWidth = 640
@@ -172,7 +179,41 @@ class CameraIntrinsicsManager:
             f"cx={self.current_rgb_intrinsics['cx']:.2f}, "
             f"cy={self.current_rgb_intrinsics['cy']:.2f}"
         )
-    
+
+    def update_resolution_from_frame(self, rgb_frame: Optional[Any]) -> bool:
+        """
+        从实际帧数据更新分辨率（老 SDK 兼容）
+
+        当 SDK 返回 0x0 分辨率时，可以从第一帧实际数据中获取真实分辨率
+
+        Args:
+            rgb_frame: RGB 帧数据（numpy array）
+
+        Returns:
+            bool: 更新成功返回 True，失败返回 False
+        """
+        if rgb_frame is None:
+            return False
+
+        try:
+            import numpy as np
+            if isinstance(rgb_frame, np.ndarray) and len(rgb_frame.shape) >= 2:
+                actual_height, actual_width = rgb_frame.shape[:2]
+
+                # 只在当前分辨率无效时才更新
+                if self.current_rgb_intrinsics['width'] == 0 or self.current_rgb_intrinsics['height'] == 0:
+                    logger.info(f"Detected actual frame resolution: {actual_width}x{actual_height}, updating intrinsics")
+                    # 直接设置实际分辨率（不缩放，因为基准分辨率就是实际的）
+                    self.rgb_intrinsics['width'] = actual_width
+                    self.rgb_intrinsics['height'] = actual_height
+                    self.current_rgb_intrinsics['width'] = actual_width
+                    self.current_rgb_intrinsics['height'] = actual_height
+                    return True
+        except Exception as e:
+            logger.debug(f"Failed to update resolution from frame: {e}")
+
+        return False
+
     def get_rgb_intrinsics_dict(self) -> Dict:
         """获取RGB内参字典（兼容格式）"""
         return {
@@ -193,7 +234,13 @@ class CameraIntrinsicsManager:
     
     def get_stereo_params_dict(self) -> Dict:
         """获取立体标定参数字典（兼容格式）"""
-        extrinsics_4x4 = self.depth_to_rgb_extrinsics
+        # 若外参为空（SDK 未提供或默认占位），使用单位矩阵防止上层崩溃
+        if self.depth_to_rgb_extrinsics is None:
+            logger.warning("Depth-to-RGB extrinsics not available, using identity fallback")
+            extrinsics_4x4 = np.eye(4, dtype=float)
+        else:
+            extrinsics_4x4 = self.depth_to_rgb_extrinsics
+
         R = extrinsics_4x4[:3, :3]
         T = extrinsics_4x4[:3, 3:4] * 1000.0  # 转换为mm
         
@@ -218,16 +265,16 @@ class CameraIntrinsicsManager:
         Raises:
             RuntimeError: 无法从SDK获取相机参数时
         """
-        if not self.camera_available or self.camera is None:
+        if self.camera is None:
             logger.warning("Camera not available, returning None values")
             return None, None, None, None, None
-        
+
         try:
             # 获取传感器标定参数
-            stCameraParam = MV3D_RGBD_CAMERA_PARAM()
+            stCameraParam = self.MV3D_RGBD_CAMERA_PARAM()
             ret = self.camera.MV3D_RGBD_GetCameraParam(pointer(stCameraParam))
-            
-            if ret != MV3D_RGBD_OK:
+
+            if ret != self.MV3D_RGBD_OK:
                 raise RuntimeError(
                     f"无法从SDK获取相机参数，错误码: 0x{ret:x}\n"
                     "请确保:\n"
@@ -245,13 +292,13 @@ class CameraIntrinsicsManager:
             
             depth_to_rgb_extrinsic = np.array([*stCameraParam.stDepth2RgbExtrinsic.fData]).reshape(4, 4)
             
-            # 验证参数有效性
+            # Validate parameter validity
             if np.all(ir_camera_intrinsic == 0) or np.all(rgb_camera_intrinsic == 0):
-                raise ValueError("从SDK获取的相机内参全为零，参数无效")
-            
-            logger.info("成功从SDK获取相机标定参数")
-            logger.debug(f"IR内参: fx={ir_camera_intrinsic[0,0]:.2f}, fy={ir_camera_intrinsic[1,1]:.2f}")
-            logger.debug(f"RGB内参: fx={rgb_camera_intrinsic[0,0]:.2f}, fy={rgb_camera_intrinsic[1,1]:.2f}")
+                raise ValueError("Camera intrinsics from SDK are all zeros, parameters invalid")
+
+            logger.info("Successfully retrieved camera calibration parameters from SDK")
+            logger.debug(f"IR intrinsics: fx={ir_camera_intrinsic[0,0]:.2f}, fy={ir_camera_intrinsic[1,1]:.2f}")
+            logger.debug(f"RGB intrinsics: fx={rgb_camera_intrinsic[0,0]:.2f}, fy={rgb_camera_intrinsic[1,1]:.2f}")
             
             return ir_camera_intrinsic, ir_camera_distortion, rgb_camera_intrinsic, rgb_camera_distortion, depth_to_rgb_extrinsic
             

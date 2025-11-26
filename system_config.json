@@ -1,0 +1,221 @@
+{
+  "system": {
+    "name": "AITable",
+    "version": "2.0",
+    "platform": "jetson_orin_nano_super",
+    "description": "Jetson Orin Nano Super "
+  },
+  "environment": {
+    "conda_env": "AITable_env",
+    "python_version": "3.8"
+  },
+  "paths": {
+    "sdk_lib_path": "libs/linux64",
+    "sdk_lib_path_aarch64": "/opt/Mv3dRgbdSDK/lib/aarch64",
+    "sdk_lib_path_linux64": "/opt/Mv3dRgbdSDK/lib/linux64",
+    "sdk_python_path": "/home/jetorin/Downloads/Res/demo/python",
+    "main_script": "main_gui.py",
+    "modules_dir": "modules",
+    "models_dir": "models",
+    "logs_dir": "logs",
+    "screenshots_dir": "screenshots"
+  },
+  "models": {
+    "yolo_face": {
+      "primary": "models/yolov8n-face.engine",
+      "fallback": [
+        "yolov8n-face.engine"
+      ],
+      "required": true,
+      "description": "TensorRT .engine",
+      "note": ".engine Ultralytics PyTorch"
+    },
+    "emonet": {
+      "primary": "models/emonet_fp16.engine",
+      "fallback": [
+        "models/emonet_fp32.engine"
+      ],
+      "required": true,
+      "description": "TensorRT-Only",
+      "note": "TensorRT docs/MODEL_CONVERSION_GUIDE.md"
+    },
+    "facemesh": {
+      "primary": "models/facemesh_fp16.engine",
+      "fallback": [
+        "models/facemesh_fp32.engine"
+      ],
+      "required": true,
+      "description": "FaceMesh TensorRT-Only",
+      "note": "TensorRT docs/MODEL_CONVERSION_GUIDE.md"
+    },
+    "yolo_pose": {
+      "primary": "models/yolov8n-pose_fp16.engine",
+      "fallback": [
+        "models/yolov8n-pose_fp32.engine"
+      ],
+      "required": true,
+      "description": "TensorRT-Only",
+      "note": "TensorRT"
+    }
+  },
+  "hardware": {
+    "platform": "jetson_orin_nano_super",
+    "cuda": {
+      "device_id": 0,
+      "memory_fraction": 0.9
+    },
+    "tof_camera": {
+      "enabled": true,
+      "sdk_name": "Mv3dRgbdSDK",
+      "required": true,
+      "device_types": ["ethernet", "usb"],
+      "description": "TOF"
+    }
+  },
+  "desk_plane": {
+    "camera_height_m": 0.3,
+    "description": "相机到桌面的垂直高度（米），用于计算眼睛到桌面的距离",
+    "notes": [
+      "相机坐标系: y轴向上为正，桌面在 y = -camera_height_m 处",
+      "平面方程: y + camera_height_m = 0",
+      "plane_model = (0, 1, 0, camera_height_m)",
+      "",
+      "测量方法: 用尺子测量相机镜头中心到桌面的垂直距离",
+      "典型值: 0.4~0.6m (显示器上方或桌面支架)"
+    ]
+  },
+  "performance": {
+    "cudnn": {
+      "enabled": true,
+      "benchmark": true,
+      "deterministic": false
+    },
+    "torch": {
+      "num_threads": 1
+    },
+    "async_inference": {
+      "enabled": false,
+      "description": "DetectionOrchestrator + InferenceScheduler",
+      "notes": [
+        "[2025-11-24] CUDA retain_primary_context",
+        "",
+        "enabled=false: sync mode",
+        "enabled=true: async mode",
+        "",
+        "TRTFaceDetector: retain_primary_context() make_context()",
+        "TRTPoseDetector: retain_primary_context() make_context()",
+        "TRTEmoNetClassifier: TensorRT API",
+        "TensorRTFaceMesh: retain_primary_context()",
+        "AsyncEngineRunner: retain_primary_context()",
+        "",
+        "2025-11-24",
+        "TRTFaceDetector._load_engine(): proper push/pop",
+        "TRTPoseDetector._load_engine(): proper push/pop",
+        "TRTFaceDetector.detect(): proper push/pop",
+        "TRTPoseDetector.detect_keypoints(): proper push/pop",
+        "",
+        "PyCUDA context.push()/pop()",
+        "proper CUDA context management",
+        "",
+        "1. sync mode first",
+        "2. enabled=true for async",
+        "3. TensorRT API modules/core/trt_engine.py"
+      ],
+      "engine_config": {
+        "emotion": {
+          "interval_frames": 10,
+          "cache_timeout": 4.0,
+          "latency_smoothing": 0.7
+        },
+        "fatigue": {
+          "latency_smoothing": 0.7
+        },
+        "pose": {
+          "interval_frames": 10,
+          "cache_timeout": 1.0,
+          "latency_smoothing": 0.7,
+          "include_full_3d_coords": true
+        }
+      }
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "enable_console": true,
+    "enable_file": true,
+    "file_rotation": "daily",
+    "max_size_mb": 100
+  },
+  "pose_angles": {
+    "description": "One-Euro filter parameters",
+    "target_fps": "3-5 FPS (dt ~ 0.2-0.33s)",
+    "pose_interval": 1,
+    "oneeuro_params": {
+      "forward": {
+        "f_min": 1.5,
+        "beta": 0.7,
+        "f_d": 1.0
+      },
+      "shoulder": {
+        "f_min": 0.8,
+        "beta": 0.35,
+        "f_d": 1.5
+      },
+      "roll": {
+        "f_min": 1.2,
+        "beta": 0.45,
+        "f_d": 1.5
+      }
+    },
+    "notes": [
+      "2025 HeadOrientationFilter slerp_alpha=0.8",
+      "",
+      "Parameter tuning:",
+      "1. HeadOrientationFilter 0.3->0.8 SLERP",
+      "2. forward One-Euro filter",
+      " - f_min: 1.0->1.5 Hz",
+      " - beta: 0.6->0.7",
+      " - f_d: 1.5->1.0",
+      "3. shoulder/roll parameters",
+      "",
+      "At 3.6 FPS / dt~0.28s:",
+      "- f_min cutoff frequency",
+      " * forward=1.5 Hz, 0.67s, 2-3 frames",
+      " * shoulder=0.8 Hz, 1.25s",
+      "- beta speed coefficient",
+      " * f_c = f_min + beta * |dx/dt|",
+      " * forward=0.7, 2-3 Hz",
+      "- f_d derivative cutoff",
+      " * forward=1.0",
+      "",
+      "Tuning direction:",
+      "- HeadOrientationFilter slerp_alpha=0.8",
+      "- forward.beta 0.7->0.75->0.8, max 0.85",
+      "- f_min forward: 1.5->1.3->1.0",
+      "- f_d forward: 1.0->0.8, min 0.5",
+      "",
+      "Interval settings:",
+      "- pose_interval: 1",
+      "- system_config.json > AITABLE_POSE_INTERVAL > default 10",
+      "- 1 = 3.6 FPS, 10 = 2.8 FPS",
+      "",
+      "Reference parameters:",
+      "- 30 FPS: forward f_min=1.2, beta=0.05, f_d=4.0",
+      "- low FPS: forward f_min=1.0, beta=0.6, f_d=1.5",
+      "- current: forward f_min=1.5, beta=0.7, f_d=1.0 + slerp_alpha=0.8"
+    ]
+  },
+  "preflight": {
+    "enabled": true,
+    "checks": {
+      "pytorch": true,
+      "cuda": true,
+      "cudnn": true,
+      "dependencies": true,
+      "models": true,
+      "tof_sdk": true
+    },
+    "fail_on_warning": false,
+    "skip_on_error": false
+  }
+}

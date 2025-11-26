@@ -10,7 +10,7 @@ class Constants:
     WARNING_DISTANCE_MAX = 0.8  # 最大警告距离
     
     # 检测配置
-    FACE_CONFIDENCE_THRESHOLD = 0.5  # 人脸检测置信度阈值
+    FACE_CONFIDENCE_THRESHOLD = 0.7  # 人脸检测置信度阈值
     SMOOTHING_WINDOW = 10  # 平滑窗口大小
     
     # 深度配置

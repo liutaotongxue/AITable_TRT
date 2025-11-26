@@ -5,47 +5,53 @@ import numpy as np
 import cv2
 import ctypes
 import struct
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Any
 from ctypes import string_at
 from ..core.logger import logger
 
-# 导入SDK定义
-import os
-import sys
-current_dir = os.path.dirname(os.path.abspath(__file__))
-camera_sdk_dir = os.path.join(os.path.dirname(os.path.dirname(current_dir)), 'camera')
-if camera_sdk_dir not in sys.path:
-    sys.path.insert(0, camera_sdk_dir)
-
-try:
-    from Mv3dRgbdImport.Mv3dRgbdDefine import (  # type: ignore
-        MV3D_RGBD_FRAME_DATA,
-        ImageType_YUV422,
-        ImageType_RGB8_Planar,
-        ImageType_Mono8,
-        ImageType_Depth,
-        ImageType_Rgbd
-    )
-    CAMERA_API_AVAILABLE = True
-except (ImportError, RuntimeError):
-    # Create dummy classes for when camera is not available
-    class MV3D_RGBD_FRAME_DATA:
-        pass
-    
-    # Dummy constants
-    ImageType_YUV422 = 0
-    ImageType_RGB8_Planar = 1
-    ImageType_Mono8 = 2
-    ImageType_Depth = 3
-    ImageType_Rgbd = 4
-    CAMERA_API_AVAILABLE = False
-
 
 class ImageDataProcessor:
-    """图像数据处理器 - 保持原版逻辑"""
-    
-    @staticmethod
-    def validate_image_data(image_data) -> bool:
+    """
+    图像数据处理器
+
+    需要从 TOFCameraManager.get_sdk_classes() 获取 SDK 常量
+    """
+
+    # 默认常量值（仅作为后备，正常情况应使用 SDK 提供的值）
+    DEFAULT_IMAGE_TYPES = {
+        'ImageType_YUV422': 0,
+        'ImageType_RGB8_Planar': 1,
+        'ImageType_Mono8': 2,
+        'ImageType_Depth': 3,
+        'ImageType_Rgbd': 4,
+    }
+
+    def __init__(self, sdk_classes: Optional[Dict[str, Any]] = None):
+        """
+        初始化图像数据处理器
+
+        Args:
+            sdk_classes: SDK 常量字典，从 TOFCameraManager.get_sdk_classes() 获取
+                        包含 ImageType_YUV422, ImageType_RGB8_Planar 等常量
+        """
+        if sdk_classes:
+            # 使用 SDK 提供的真实常量
+            self.ImageType_YUV422 = sdk_classes.get('ImageType_YUV422', self.DEFAULT_IMAGE_TYPES['ImageType_YUV422'])
+            self.ImageType_RGB8_Planar = sdk_classes.get('ImageType_RGB8_Planar', self.DEFAULT_IMAGE_TYPES['ImageType_RGB8_Planar'])
+            self.ImageType_Mono8 = sdk_classes.get('ImageType_Mono8', self.DEFAULT_IMAGE_TYPES['ImageType_Mono8'])
+            self.ImageType_Depth = sdk_classes.get('ImageType_Depth', self.DEFAULT_IMAGE_TYPES['ImageType_Depth'])
+            self.ImageType_Rgbd = sdk_classes.get('ImageType_Rgbd', self.DEFAULT_IMAGE_TYPES['ImageType_Rgbd'])
+            logger.debug("ImageDataProcessor initialized with SDK constants")
+        else:
+            # 使用默认值（警告：可能与实际 SDK 不匹配）
+            self.ImageType_YUV422 = self.DEFAULT_IMAGE_TYPES['ImageType_YUV422']
+            self.ImageType_RGB8_Planar = self.DEFAULT_IMAGE_TYPES['ImageType_RGB8_Planar']
+            self.ImageType_Mono8 = self.DEFAULT_IMAGE_TYPES['ImageType_Mono8']
+            self.ImageType_Depth = self.DEFAULT_IMAGE_TYPES['ImageType_Depth']
+            self.ImageType_Rgbd = self.DEFAULT_IMAGE_TYPES['ImageType_Rgbd']
+            logger.warning("ImageDataProcessor initialized with DEFAULT constants - may not match SDK!")
+
+    def validate_image_data(self, image_data) -> bool:
         """验证图像数据有效性"""
         return all([
             hasattr(image_data, 'nWidth'), hasattr(image_data, 'nHeight'),
@@ -53,20 +59,19 @@ class ImageDataProcessor:
             image_data.nWidth > 0, image_data.nHeight > 0,
             image_data.nDataLen > 0, image_data.pData
         ])
-    
-    @staticmethod
-    def extract_raw_data(image_data, dtype=np.uint8):
-        """提取原始数据 - 保持原版逻辑"""
-        if image_data.enImageType == ImageType_Depth:
+
+    def extract_raw_data(self, image_data, dtype=np.uint8):
+        """提取原始数据"""
+        if image_data.enImageType == self.ImageType_Depth:
             element_size = 2
             dtype = np.uint16
             c_type = ctypes.c_uint16
         else:
             element_size = 1
             c_type = ctypes.c_ubyte
-            
+
         num_elements = image_data.nDataLen // element_size
-        
+
         if hasattr(image_data.pData, 'contents'):
             data_ptr = ctypes.cast(image_data.pData, ctypes.POINTER(c_type * num_elements))
             return np.array(data_ptr.contents, dtype=dtype)
@@ -75,59 +80,58 @@ class ImageDataProcessor:
                 (c_type * num_elements).from_address(image_data.pData),
                 dtype=dtype
             )
-    
-    @staticmethod
-    def process_frame_data(frame_data: MV3D_RGBD_FRAME_DATA) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """处理帧数据 - 保持原版逻辑"""
+
+    def process_frame_data(self, frame_data) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """处理帧数据，返回 RGB 和深度图"""
         rgb_frame = None
         depth_frame = None
-        
+
         for i in range(frame_data.nImageCount):
             image_data = frame_data.stImageData[i]
-            
-            if not ImageDataProcessor.validate_image_data(image_data):
+
+            if not self.validate_image_data(image_data):
                 continue
-            
+
             try:
-                if image_data.enImageType == ImageType_Depth:
-                    depth_data = ImageDataProcessor.extract_raw_data(image_data)
+                if image_data.enImageType == self.ImageType_Depth:
+                    depth_data = self.extract_raw_data(image_data)
                     depth_frame = depth_data.reshape((image_data.nHeight, image_data.nWidth))
-                    
-                elif image_data.enImageType == ImageType_Mono8:
-                    mono_data = ImageDataProcessor.extract_raw_data(image_data)
+
+                elif image_data.enImageType == self.ImageType_Mono8:
+                    mono_data = self.extract_raw_data(image_data)
                     mono_frame = mono_data.reshape((image_data.nHeight, image_data.nWidth))
                     rgb_frame = cv2.cvtColor(mono_frame, cv2.COLOR_GRAY2BGR)
-                    
-                elif image_data.enImageType == ImageType_YUV422:
-                    yuv_data = ImageDataProcessor.extract_raw_data(image_data)
+
+                elif image_data.enImageType == self.ImageType_YUV422:
+                    yuv_data = self.extract_raw_data(image_data)
                     yuv_frame = yuv_data.reshape((image_data.nHeight, image_data.nWidth * 2))
                     rgb_frame = cv2.cvtColor(yuv_frame, cv2.COLOR_YUV2BGR_YUYV)
-                    
-                elif image_data.enImageType == ImageType_RGB8_Planar:
-                    rgb_data = ImageDataProcessor.extract_raw_data(image_data)
+
+                elif image_data.enImageType == self.ImageType_RGB8_Planar:
+                    rgb_data = self.extract_raw_data(image_data)
                     height, width = image_data.nHeight, image_data.nWidth
                     plane_size = height * width
-                    
+
                     r_plane = rgb_data[:plane_size].reshape((height, width))
                     g_plane = rgb_data[plane_size:2*plane_size].reshape((height, width))
                     b_plane = rgb_data[2*plane_size:3*plane_size].reshape((height, width))
                     rgb_frame = np.stack([b_plane, g_plane, r_plane], axis=2)
-                    
-                elif image_data.enImageType == ImageType_Rgbd:
-                    rgbd_data = ImageDataProcessor.extract_raw_data(image_data, dtype=np.uint8)
+
+                elif image_data.enImageType == self.ImageType_Rgbd:
+                    rgbd_data = self.extract_raw_data(image_data, dtype=np.uint8)
                     height, width = image_data.nHeight, image_data.nWidth
-                    
+
                     if len(rgbd_data) == height * width * 5:
                         rgbd_reshaped = rgbd_data.reshape((height, width, 5))
                         rgb_frame = rgbd_reshaped[:, :, :3]
                         depth_raw = rgbd_reshaped[:, :, 3:5]
                         depth_frame = (depth_raw[:, :, 1].astype(np.uint16) << 8) | depth_raw[:, :, 0].astype(np.uint16)
-                        logger.info(f"Processed RGBD image: RGB {rgb_frame.shape}, Depth {depth_frame.shape}")
-                    
+                        logger.debug(f"Processed RGBD image: RGB {rgb_frame.shape}, Depth {depth_frame.shape}")
+
             except Exception as e:
                 logger.error(f"Error processing image type {image_data.enImageType}: {e}")
                 continue
-        
+
         return rgb_frame, depth_frame
     
     @staticmethod
