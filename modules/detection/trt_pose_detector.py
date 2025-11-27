@@ -8,11 +8,13 @@ TensorRT YOLO Pose 推理封装
 - 统一的 reshape/transpose 逻辑，兼容 (1, 56, 8400)、(1, 8400, 56)、动态 batch 等
 - 运行时动态查询 binding shape，支持 profile 切换（不同输入尺寸/batch）
 - 运行时校验确保关键点坐标正确映射
+- 自动检测置信度格式（logit vs 概率），避免重复 sigmoid
 - 详细的调试日志（通过环境变量 AITABLE_DEBUG_POSE=1 启用）
 """
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import time
+import os
 
 import numpy as np
 import cv2
@@ -167,7 +169,7 @@ class TRTPoseDetector:
     def __init__(
         self,
         engine_path: str,
-        confidence_threshold: float = 0.25,
+        confidence_threshold: float = 0.5,
         iou_threshold: float = 0.45,
         input_size: Tuple[int, int] = (640, 640),
     ):
@@ -176,7 +178,7 @@ class TRTPoseDetector:
 
         Args:
             engine_path: TensorRT 引擎文件路径 (.engine)
-            confidence_threshold: 检测置信度阈值（默认 0.25，适用于 sigmoid 后的概率值）
+            confidence_threshold: 检测置信度阈值（默认 0.5，适用于概率值）
             iou_threshold: NMS IoU 阈值
             input_size: 模型输入尺寸 (height, width)
         """
@@ -214,6 +216,12 @@ class TRTPoseDetector:
         self.output_binding_idx = None   # 输出 binding 索引（用于运行时查询）
         self.num_keypoints = 17          # 默认值，将从引擎推断
         self.output_dim = 56             # 默认值，将从引擎推断
+
+        # ========== 新增：置信度格式自动检测 ==========
+        # None = 未检测，True = 需要 sigmoid，False = 已是概率
+        self._confidence_needs_sigmoid = None
+        self._format_detection_done = False
+        # =============================================
 
         # 统计信息
         self._inference_count = 0
@@ -390,7 +398,6 @@ class TRTPoseDetector:
         preprocessed = np.expand_dims(preprocessed, axis=0)  # (1, 3, H, W)
 
         # 1️⃣ 预处理阶段日志
-        import os
         if os.getenv('AITABLE_DEBUG_POSE', '0') == '1':
             logger.debug(
                 f"[Pose] preprocess: orig={img_w}x{img_h} -> resized={new_w}x{new_h} "
@@ -424,8 +431,6 @@ class TRTPoseDetector:
             - (batch, N, 56)  -> 动态 batch + anchor 优先
             - (-1, 56, 8400)  -> 动态维度（TensorRT 返回 -1）
         """
-        import os
-
         # 1. 处理动态形状：从实际数据推断真实 shape
         total_elements = raw_output.size
         if -1 in binding_shape:
@@ -558,6 +563,42 @@ class TRTPoseDetector:
 
         return predictions
 
+    def _detect_confidence_format(self, obj_conf: np.ndarray) -> bool:
+        """
+        自动检测置信度输出格式：是 logit 还是概率值
+        
+        Args:
+            obj_conf: 原始置信度数组
+            
+        Returns:
+            True = 需要 sigmoid（输出是 logit）
+            False = 不需要 sigmoid（输出已是概率）
+        """
+        min_val = obj_conf.min()
+        max_val = obj_conf.max()
+        
+        # 判断逻辑：
+        # - 如果值超出 [0, 1] 范围较多，说明是 logit（需要 sigmoid）
+        # - 如果值在 [0, 1] 范围内，说明已经是概率（不需要 sigmoid）
+        
+        # logit 值的典型范围：[-10, 10] 或更大
+        # 概率值的范围：[0, 1]
+        
+        if max_val > 1.5 or min_val < -0.5:
+            # 明显超出 [0, 1]，是 logit
+            logger.info(
+                f"[置信度格式检测] 检测到 logit 格式: "
+                f"min={min_val:.4f}, max={max_val:.4f} -> 需要 sigmoid"
+            )
+            return True
+        else:
+            # 在 [0, 1] 范围内，已是概率
+            logger.info(
+                f"[置信度格式检测] 检测到概率格式: "
+                f"min={min_val:.4f}, max={max_val:.4f} -> 跳过 sigmoid"
+            )
+            return False
+
     def postprocess(
         self,
         outputs: np.ndarray,
@@ -589,28 +630,18 @@ class TRTPoseDetector:
         pad_w, pad_h = padding
 
         # ========== 使用统一的 reshape 函数处理 TensorRT 输出 ==========
-        # 替代原有的简单 reshape + 转置逻辑
-        # 现在支持:
-        # - (1, 56, 8400)   -> 通道优先，自动转置
-        # - (1, 8400, 56)   -> anchor 优先，直接 reshape
-        # - 动态 batch 格式
-        # - 动态维度（-1）
-        # - 动态 profile 切换（运行时查询真实 binding shape）
         try:
             # 运行时动态获取当前帧的真实 binding shape
-            # 这样即使通过 context.set_binding_shape() 切换了 profile，也能正确处理
             if self.output_binding_idx is not None:
                 try:
                     runtime_shape = self.context.get_binding_shape(self.output_binding_idx)
                     actual_binding_shape = tuple(runtime_shape)
                 except Exception as e:
-                    # 如果运行时查询失败（例如旧版 TensorRT），回退到初始 shape
                     logger.warning(
                         f"运行时查询 binding shape 失败: {e}，使用初始 shape {self.output_shape}"
                     )
                     actual_binding_shape = self.output_shape
             else:
-                # 没有保存 binding index（不应该发生），使用初始 shape
                 actual_binding_shape = self.output_shape
 
             # 调用统一 reshape 函数
@@ -620,13 +651,9 @@ class TRTPoseDetector:
                 output_dim=self.output_dim
             )
 
-            # 使用自动检测的关键点数量
             num_kps = self.num_keypoints
 
-            # 调试日志：输出 reshape 后的统计信息
-            import os
             if os.getenv('AITABLE_DEBUG_POSE', '0') == '1':
-                # 显示运行时 shape（如果与初始 shape 不同，说明发生了 profile 切换）
                 shape_info = f"runtime_shape={actual_binding_shape}"
                 if actual_binding_shape != self.output_shape:
                     shape_info += f" (初始: {self.output_shape}, 已切换 profile)"
@@ -636,16 +663,8 @@ class TRTPoseDetector:
                     f"最终 predictions.shape={predictions.shape}, "
                     f"output_dim={self.output_dim}, num_keypoints={num_kps}"
                 )
-                # 打印前几个 box 的 objectness 置信度（原始 logit 值）
-                if predictions.shape[1] > 0:
-                    sample_obj_logits = predictions[0, :min(5, predictions.shape[1]), 4]
-                    logger.debug(
-                        f"[Reshape] 前 {len(sample_obj_logits)} 个 box 的 obj_logit: "
-                        f"{sample_obj_logits}"
-                    )
 
         except Exception as e:
-            # 尝试获取运行时 shape 用于错误诊断
             try:
                 runtime_shape = self.context.get_binding_shape(self.output_binding_idx)
                 shape_info = f"runtime_shape={tuple(runtime_shape)}, initial_shape={self.output_shape}"
@@ -663,22 +682,27 @@ class TRTPoseDetector:
         # 提取第一个 batch（单图推理）
         preds = predictions[0]  # (num_boxes, output_dim)
 
-        # 解析输出（动态适配关键点数量）
+        # 解析输出
         # [0:4]   -> bbox (cx, cy, w, h)
-        # [4]     -> objectness confidence (logit, 需要 sigmoid)
+        # [4]     -> objectness confidence
         # [5:]    -> num_keypoints * 3 (x, y, conf)
         boxes_xywh = preds[:, :4]  # (num_boxes, 4)
-        obj_conf = preds[:, 4]     # (num_boxes,) - 原始 logit 值
-
-        # 重要：TensorRT 输出的是 logit 值，需要 sigmoid 转换为概率
-        # confidences = sigmoid(obj_conf) = 1 / (1 + exp(-obj_conf))
-        confidences = 1.0 / (1.0 + np.exp(-obj_conf))
-
+        obj_conf = preds[:, 4]     # (num_boxes,)
         kps_raw = preds[:, 5:]     # (num_boxes, num_kps*3)
 
-        # 调试：打印 boxes_xywh 范围，判断 engine 输出类型
-        # 范围 0~640 = 已解码像素坐标，范围 0~2 = raw 预测值
-        import os
+        # ========== 自动检测置信度格式（只在第一帧做） ==========
+        if not self._format_detection_done:
+            self._confidence_needs_sigmoid = self._detect_confidence_format(obj_conf)
+            self._format_detection_done = True
+
+        # 根据检测结果决定是否应用 sigmoid
+        if self._confidence_needs_sigmoid:
+            confidences = 1.0 / (1.0 + np.exp(-np.clip(obj_conf, -50, 50)))
+        else:
+            # 已经是概率值，直接使用，但确保在 [0, 1] 范围内
+            confidences = np.clip(obj_conf, 0.0, 1.0)
+
+        # 调试日志
         if os.getenv('AITABLE_DEBUG_POSE', '0') == '1':
             logger.info(
                 f"[EngineOutput] boxes_xywh range: "
@@ -687,6 +711,10 @@ class TRTPoseDetector:
                 f"w=[{boxes_xywh[:, 2].min():.2f}, {boxes_xywh[:, 2].max():.2f}], "
                 f"h=[{boxes_xywh[:, 3].min():.2f}, {boxes_xywh[:, 3].max():.2f}]"
             )
+            logger.debug(
+                f"[Confidence] sigmoid={'applied' if self._confidence_needs_sigmoid else 'skipped'}, "
+                f"conf range: [{confidences.min():.4f}, {confidences.max():.4f}]"
+            )
 
         # 1. 过滤低置信度检测
         mask = confidences >= self.confidence_threshold
@@ -694,8 +722,6 @@ class TRTPoseDetector:
         num_after_filter = mask.sum()
         max_conf = confidences.max() if confidences.size else 0.0
 
-        # 2️⃣ 后处理阶段日志 - 过滤前统计
-        import os
         if os.getenv('AITABLE_DEBUG_POSE', '0') == '1':
             logger.debug(
                 f"[Pose] boxes before filter: total={num_before_filter}, "
@@ -726,7 +752,6 @@ class TRTPoseDetector:
         keep_indices = nms_boxes(boxes_xyxy, confidences, self.iou_threshold)
         num_after_nms = len(keep_indices)
 
-        # 2️⃣ 后处理阶段日志 - NMS 后统计
         if os.getenv('AITABLE_DEBUG_POSE', '0') == '1':
             logger.debug(
                 f"[Pose] boxes after NMS: after_conf={num_after_filter}, "
@@ -748,17 +773,16 @@ class TRTPoseDetector:
 
             # 解析关键点: [x1, y1, c1, x2, y2, c2, ...]
             kps_reshaped = kps.reshape(num_kps, 3)  # (num_kps, 3)
-            kps_xy = kps_reshaped[:, :2]  # (num_kps, 2) - 归一化值 [0, 1]
-            kps_conf_logit = kps_reshaped[:, 2]  # (num_kps,) - 原始 logit 值
+            kps_xy = kps_reshaped[:, :2]  # (num_kps, 2)
+            kps_conf_raw = kps_reshaped[:, 2]  # (num_kps,)
 
-            # 重要：关键点置信度也是 logit 值，需要 sigmoid 转换
-            kps_conf = 1.0 / (1.0 + np.exp(-kps_conf_logit))
-            kps_conf = np.clip(kps_conf, 0.0, 1.0)
+            # 关键点置信度处理（与 objectness 使用相同策略）
+            if self._confidence_needs_sigmoid:
+                kps_conf = 1.0 / (1.0 + np.exp(-np.clip(kps_conf_raw, -50, 50)))
+            else:
+                kps_conf = np.clip(kps_conf_raw, 0.0, 1.0)
 
-            # ========== letterbox 模式的坐标还原（正确处理）==========
-            # 判断 YOLO Pose 输出格式：归一化值 [0, 1] 还是像素值 [0, 640]
-            # 根据实际观察，某些 TensorRT 引擎输出已经是像素坐标
-
+            # ========== letterbox 模式的坐标还原 ==========
             target_h, target_w = self.input_size  # (640, 640)
 
             # 步骤 1: 检测坐标格式并转换为 letterbox 像素坐标
@@ -781,8 +805,6 @@ class TRTPoseDetector:
             box_scaled[[0, 2]] = (box_scaled[[0, 2]] - pad_w) / scale
             box_scaled[[1, 3]] = (box_scaled[[1, 3]] - pad_h) / scale
 
-            # 调试日志：验证关键点坐标转换（可通过环境变量 AITABLE_DEBUG_POSE=1 启用）
-            import os
             if os.getenv('AITABLE_DEBUG_POSE', '0') == '1':
                 logger.debug(
                     f"[PoseCoords] 坐标转换链（letterbox 模式）: "
@@ -791,18 +813,6 @@ class TRTPoseDetector:
                     f"原图像素范围=[{kps_xy_scaled.min():.1f}, {kps_xy_scaled.max():.1f}] "
                     f"(scale={scale:.3f}, pad=({pad_w},{pad_h}))"
                 )
-                # 打印关键关键点（眼睛、肩膀、鼻子）的具体坐标
-                key_indices = [0, 1, 2, 5, 6]  # 鼻子、左眼、右眼、左肩、右肩
-                kp_names = ['nose', 'left_eye', 'right_eye', 'left_shoulder', 'right_shoulder']
-                for i, kp_idx in enumerate(key_indices):
-                    if kp_idx < num_kps and kps_conf[kp_idx] > 0.3:
-                        logger.debug(
-                            f"  KP[{kp_idx}] {kp_names[i]}: "
-                            f"raw=({kps_reshaped[kp_idx, 0]:.3f}, {kps_reshaped[kp_idx, 1]:.3f}) -> "
-                            f"letterbox=({kps_xy_letterbox[kp_idx, 0]:.1f}, {kps_xy_letterbox[kp_idx, 1]:.1f}) -> "
-                            f"orig=({kps_xy_scaled[kp_idx, 0]:.1f}, {kps_xy_scaled[kp_idx, 1]:.1f}), "
-                            f"conf={kps_conf[kp_idx]:.3f}"
-                        )
 
             # 限制坐标在原图范围内
             orig_h, orig_w = original_shape
@@ -810,14 +820,14 @@ class TRTPoseDetector:
             kps_xy_scaled[:, 0] = np.clip(kps_xy_scaled[:, 0], 0, orig_w)
             kps_xy_scaled[:, 1] = np.clip(kps_xy_scaled[:, 1], 0, orig_h)
 
-            # 构造关键点列表（使用动态关键点数量）
+            # 构造关键点列表
             keypoints_list = []
             for kp_idx in range(num_kps):
                 keypoints_list.append({
                     'index': kp_idx,
                     'x': float(kps_xy_scaled[kp_idx, 0]),
                     'y': float(kps_xy_scaled[kp_idx, 1]),
-                    'confidence': float(kps_conf[kp_idx]),  # 已裁剪到 [0, 1]
+                    'confidence': float(kps_conf[kp_idx]),
                 })
 
             # 添加检测结果
@@ -834,21 +844,14 @@ class TRTPoseDetector:
             }
             detections.append(detection_dict)
 
-            # 2️⃣ 后处理阶段日志 - 检测输出摘要
             if os.getenv('AITABLE_DEBUG_POSE', '0') == '1':
-                # 打印关键关键点的坐标和置信度（鼻子、左肩、右肩）
                 nose_x = kps_xy_scaled[0, 0] if num_kps > 0 else 0
                 nose_y = kps_xy_scaled[0, 1] if num_kps > 0 else 0
                 nose_conf = kps_conf[0] if num_kps > 0 else 0
 
-                left_shoulder_x = kps_xy_scaled[5, 0] if num_kps > 5 else 0
-                left_shoulder_y = kps_xy_scaled[5, 1] if num_kps > 5 else 0
-                left_shoulder_conf = kps_conf[5] if num_kps > 5 else 0
-
                 logger.debug(
                     f"[Pose] detection #{len(detections)}: conf={conf:.3f}, "
-                    f"nose=({nose_x:.1f}, {nose_y:.1f}, {nose_conf:.2f}), "
-                    f"left_shoulder=({left_shoulder_x:.1f}, {left_shoulder_y:.1f}, {left_shoulder_conf:.2f})"
+                    f"nose=({nose_x:.1f}, {nose_y:.1f}, {nose_conf:.2f})"
                 )
 
         return detections
@@ -887,7 +890,6 @@ class TRTPoseDetector:
         # 后处理
         output_data = self.host_outputs[0]  # 展开的 1D 数组
 
-        # 注意：output_data 已经是 1D 数组，postprocess() 会自动 reshape
         detections = self.postprocess(
             output_data,
             scale,
@@ -899,8 +901,6 @@ class TRTPoseDetector:
         latency_ms = (end - start) * 1000.0
         self._update_stats(latency_ms)
 
-        # 3️⃣ 推理阶段日志
-        import os
         if os.getenv('AITABLE_DEBUG_POSE', '0') == '1':
             logger.debug(f"[Pose] inference latency: {latency_ms:.2f} ms")
 
@@ -940,6 +940,7 @@ class TRTPoseDetector:
             "input_size": self.input_size,
             "confidence_threshold": self.confidence_threshold,
             "iou_threshold": self.iou_threshold,
+            "confidence_format": "logit" if self._confidence_needs_sigmoid else "probability",
         }
         if avg_latency is not None:
             info["avg_inference_latency_ms"] = round(avg_latency, 2)
@@ -980,7 +981,6 @@ class TRTPoseDetector:
             if self.cuda_ctx:
                 try:
                     self.cuda_ctx.pop()
-                    # 注意：不调用 detach()，让 Python 垃圾回收处理
                 except Exception:
                     pass
 

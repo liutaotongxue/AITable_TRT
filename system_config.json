@@ -53,6 +53,8 @@
       "fallback": [
         "models/yolov8n-pose_fp32.engine"
       ],
+      "confidence_threshold": 0.5,
+      "iou_threshold": 0.45,
       "required": true,
       "description": "TensorRT-Only",
       "note": "TensorRT"
@@ -71,6 +73,13 @@
       "device_types": ["ethernet", "usb"],
       "description": "TOF"
     }
+  },
+  "tracking": {
+    "enabled": true,
+    "depth_range_min": 200,
+    "depth_range_max": 1500,
+    "switch_depth_delta_mm": 100,
+    "min_keep_frames": 15
   },
   "desk_plane": {
     "camera_height_m": 0.3,

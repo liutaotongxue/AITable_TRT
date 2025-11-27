@@ -104,7 +104,13 @@ def run_orchestrator_mode(config):
             # 姿态检测器
             pose_config = config.models.get('yolo_pose', {})
             pose_model_path = pose_config.get('primary', 'models/yolov8n-pose_fp16.engine')
-            pose_detector = TRTPoseDetector(engine_path=pose_model_path)
+            pose_conf = pose_config.get('confidence_threshold', 0.5)
+            pose_iou = pose_config.get('iou_threshold', 0.45)
+            pose_detector = TRTPoseDetector(
+                engine_path=pose_model_path,
+                confidence_threshold=pose_conf,
+                iou_threshold=pose_iou
+            )
             logger.info(f" 姿态检测模块初始化成功（TensorRT YOLO Pose）: {pose_model_path}")
 
             # 创建引擎
@@ -231,7 +237,13 @@ def run_sync_mode(config):
                 from modules.detection import TRTPoseDetector
                 pose_config = config.models.get('yolo_pose', {})
                 pose_model_path = pose_config.get('primary', 'models/yolov8n-pose_fp16.engine')
-                pose_detector = TRTPoseDetector(engine_path=pose_model_path)
+                pose_conf = pose_config.get('confidence_threshold', 0.5)
+                pose_iou = pose_config.get('iou_threshold', 0.45)
+                pose_detector = TRTPoseDetector(
+                    engine_path=pose_model_path,
+                    confidence_threshold=pose_conf,
+                    iou_threshold=pose_iou
+                )
                 logger.info(f" 姿态检测模块初始化成功（TensorRT YOLO Pose）: {pose_model_path}")
             except Exception as e:
                 logger.error(f" 姿态检测模块初始化失败: {e}")
@@ -369,6 +381,15 @@ def run_main_loop(system, emotion_classifier=None, fatigue_detector=None, pose_d
                     if pose_detector:
                         try:
                             pose_results = pose_detector.detect_keypoints(rgb_frame)
+
+                            # ===== 简单调试 =====
+                            if pose_results:
+                                dets = pose_results.get('detections', [])
+                                logger.info(f"[Pose] 检测到 {len(dets)} 个人")
+                            else:
+                                logger.info("[Pose] 无检测结果")
+                            # ====================
+
                             if pose_results:
                                 if results is None:
                                     results = {}

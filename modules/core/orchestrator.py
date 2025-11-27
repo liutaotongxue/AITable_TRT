@@ -19,6 +19,14 @@ from ..monitoring.resource import ResourceMonitor
 from ..core.inference_scheduler import InferenceScheduler, SchedulerConfig
 from ..detection import ROIManager
 
+# SimpleTracker（可选导入，模块不存在时禁用追踪模式）
+try:
+    from ..tracking import SimpleTracker
+    _TRACKER_AVAILABLE = True
+except ImportError:
+    SimpleTracker = None
+    _TRACKER_AVAILABLE = False
+
 
 class DetectionOrchestrator:
     """
@@ -109,6 +117,35 @@ class DetectionOrchestrator:
 
         # ROI 管理器（统一的人脸裁剪逻辑）
         self.roi_manager = ROIManager(margin=0.0, min_size=20)
+
+        # ========== SimpleTracker 初始化 ==========
+        self.tracker = None
+        self.tracking_enabled = False
+
+        tracking_cfg = self.system_config.get('tracking', {})
+        _tracking_cfg_enabled = tracking_cfg.get('enabled', False)
+
+        if _tracking_cfg_enabled and _TRACKER_AVAILABLE and self.pose_detector:
+            try:
+                self.tracker = SimpleTracker(
+                    depth_range_mm=(
+                        tracking_cfg.get('depth_range_min', 200),
+                        tracking_cfg.get('depth_range_max', 1500)
+                    ),
+                    switch_depth_delta_mm=tracking_cfg.get('switch_depth_delta_mm', 100),
+                    min_keep_frames=tracking_cfg.get('min_keep_frames', 15),
+                )
+                self.tracking_enabled = True
+                logger.info("SimpleTracker 初始化成功")
+            except Exception as e:
+                logger.warning(f"SimpleTracker 初始化失败: {e}")
+                self.tracker = None
+                self.tracking_enabled = False
+        elif _tracking_cfg_enabled and not _TRACKER_AVAILABLE:
+            logger.warning("tracking 模块不可用，使用原 Face 检测模式")
+        elif _tracking_cfg_enabled and not self.pose_detector:
+            logger.warning("pose_detector 未提供，无法启用追踪模式")
+        # ==========================================
 
         # 帧率监控器（替代手动 FPS 计算）
         self.fps_monitor = FrameRateMonitor(smoothing=0.9)
@@ -280,7 +317,6 @@ class DetectionOrchestrator:
                     # 帧解码成功（无效帧计数可选重置，这里不重置因为WindowManager已管理）
 
                     # ========== 单帧检测流程 ==========
-                    # 初始化变量
                     results = None
                     vis_from_system = None
                     current_face_detected = False
@@ -288,30 +324,57 @@ class DetectionOrchestrator:
                     face_roi = None
                     face_appeared = False
 
-                    # 单帧检测（取最高置信度人脸）
-                    detection = self.system.face_detector.detect_face(rgb_frame)
+                    # ========== SimpleTracker 模式 vs Face 检测模式 ==========
+                    if self.tracking_enabled and self.tracker:
+                        # --- SimpleTracker 模式 ---
+                        pose_raw = self.pose_detector.detect_keypoints(rgb_frame)
 
-                    if detection:
-                        current_face_detected = True
-                        face_bbox = detection['bbox']
-                        face_appeared = not self.previous_face_detected
+                        if pose_raw and pose_raw.get('detections'):
+                            self.tracker.update(pose_raw['detections'], depth_frame)
+                        else:
+                            self.tracker.update([], depth_frame)
 
-                        # 使用 EyeDistanceSystem 计算距离
-                        results, vis_from_system = self.system.process_frame(rgb_frame, depth_frame)
+                        target = self.tracker.get_primary_target()
 
-                        # 提取 face ROI
-                        if face_bbox:
-                            rois = self.roi_manager.extract_dual(
-                                rgb_frame,
-                                face_bbox=face_bbox,
-                                person_bbox=None
+                        if target:
+                            current_face_detected = True
+                            face_appeared = not self.previous_face_detected
+
+                            results, vis_from_system = self._process_with_tracker_target(
+                                target, rgb_frame, depth_frame
                             )
-                            face_roi = rois.get('face_roi')
+
+                            if target.face_valid and target.face_bbox:
+                                x1, y1, x2, y2 = target.face_bbox
+                                face_bbox = {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y2)}
+                            elif target.bbox:
+                                x1, y1, x2, y2 = target.bbox
+                                head_h = (y2 - y1) / 6
+                                face_bbox = {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y1 + head_h)}
+
+                            if face_bbox:
+                                rois = self.roi_manager.extract_dual(rgb_frame, face_bbox=face_bbox, person_bbox=None)
+                                face_roi = rois.get('face_roi')
+                        else:
+                            vis_from_system = self.system.visualizer.draw_no_detection(rgb_frame.copy(), "Tracker")
+                            self.previous_face_detected = False
+
                     else:
-                        vis_from_system = self.system.visualizer.draw_no_detection(
-                            rgb_frame.copy(), "YOLO"
-                        )
-                        self.previous_face_detected = False
+                        # --- 原 Face 检测模式 ---
+                        detection = self.system.face_detector.detect_face(rgb_frame)
+
+                        if detection:
+                            current_face_detected = True
+                            face_bbox = detection['bbox']
+                            face_appeared = not self.previous_face_detected
+                            results, vis_from_system = self.system.process_frame(rgb_frame, depth_frame)
+
+                            if face_bbox:
+                                rois = self.roi_manager.extract_dual(rgb_frame, face_bbox=face_bbox, person_bbox=None)
+                                face_roi = rois.get('face_roi')
+                        else:
+                            vis_from_system = self.system.visualizer.draw_no_detection(rgb_frame.copy(), "YOLO")
+                            self.previous_face_detected = False
 
                     # ========== 推理执行（同步/异步分支）==========
                     if self.async_enabled and self.inference_scheduler:
@@ -578,6 +641,83 @@ class DetectionOrchestrator:
         else:
             logger.info("可视化已禁用: 销毁窗口 (推理继续)")
             self.window_manager.disable()
+
+    def _process_with_tracker_target(self, target, rgb_frame, depth_frame):
+        """使用 SimpleTracker 的目标计算眼距"""
+        if target is None:
+            return None, self.system.visualizer.draw_no_detection(rgb_frame.copy(), "Tracker")
+
+        self.system.frame_count += 1
+        start_time = time.time()
+        self.system.update_camera_resolution(rgb_frame)
+
+        # 从 target 提取眼睛位置
+        left_eye_pos = (int(target.left_eye[0]), int(target.left_eye[1])) if target.left_eye else None
+        right_eye_pos = (int(target.right_eye[0]), int(target.right_eye[1])) if target.right_eye else None
+
+        # 计算距离
+        distances = []
+        eye_results = {}
+        depth_available = False
+
+        for eye_name, eye_pos in [('left', left_eye_pos), ('right', right_eye_pos)]:
+            if eye_pos is None:
+                eye_results[eye_name] = {'position': None, 'depth': None, 'coord_3d': None, 'distance': None}
+                continue
+
+            depth_value = self.system.get_robust_depth(depth_frame, eye_pos[0], eye_pos[1])
+
+            if depth_value:
+                coord_3d = self.system.pixel_to_3d(eye_pos[0], eye_pos[1], depth_value)
+                distance = self.system.calculate_distance_to_plane(coord_3d)
+                distances.append(distance)
+                eye_results[eye_name] = {
+                    'position': eye_pos, 'depth': depth_value,
+                    'coord_3d': coord_3d, 'distance': distance
+                }
+                depth_available = True
+            else:
+                eye_results[eye_name] = {'position': eye_pos, 'depth': None, 'coord_3d': None, 'distance': None}
+
+        raw_distance = np.mean(distances) if distances else None
+        stable_distance = self.system.distance_processor.add_measurement(raw_distance) if raw_distance else None
+        stability_score = self.system.distance_processor.get_stability_score()
+
+        process_time = time.time() - start_time
+        self.system.processing_times.append(process_time)
+
+        # 构建 detection
+        detection = None
+        if target.face_bbox:
+            x1, y1, x2, y2 = target.face_bbox
+            detection = {
+                'bbox': {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y2)},
+                'confidence': target.face_confidence,
+                'left_eye': left_eye_pos, 'right_eye': right_eye_pos,
+            }
+        elif target.bbox:
+            x1, y1, x2, y2 = target.bbox
+            detection = {
+                'bbox': {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y2)},
+                'confidence': target.confidence,
+                'left_eye': left_eye_pos, 'right_eye': right_eye_pos,
+            }
+
+        results = {
+            'frame': self.system.frame_count,
+            'raw_distance': raw_distance,
+            'stable_distance': stable_distance,
+            'stability_score': stability_score,
+            'eye_results': eye_results,
+            'detection': detection,
+            'process_time': process_time,
+            'fps': 1.0 / np.mean(self.system.processing_times) if self.system.processing_times else 0,
+            'depth_available': depth_available,
+            'track_id': target.track_id,
+        }
+
+        visualization = self.system.visualizer.draw_visualization(rgb_frame.copy(), results, "Pose Tracker")
+        return results, visualization
 
     def cleanup(self):
         """清理资源"""
