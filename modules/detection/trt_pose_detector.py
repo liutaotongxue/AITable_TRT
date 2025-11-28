@@ -195,6 +195,8 @@ class TRTPoseDetector:
 
         # CUDA 上下文管理（手动初始化以避免与 PyTorch 冲突）
         self.cuda_ctx = None
+        self._owns_cuda_context = False
+        self._closed = False
         self._init_cuda_context()
 
         # TensorRT 组件
@@ -254,6 +256,7 @@ class TRTPoseDetector:
                 if current_ctx:
                     logger.info("检测到已存在的 CUDA 上下文，复用")
                     self.cuda_ctx = current_ctx
+                    self._owns_cuda_context = False
                     return
             except cuda.LogicError:
                 # 无当前上下文，创建新的
@@ -262,11 +265,13 @@ class TRTPoseDetector:
             # 创建新的 CUDA 上下文
             device = cuda.Device(0)
             self.cuda_ctx = device.make_context()
+            self._owns_cuda_context = True
             logger.info("创建新的 CUDA 上下文（设备 0）")
 
         except Exception as e:
             logger.warning(f"CUDA 上下文初始化失败: {e}，尝试继续（可能依赖现有上下文）")
             self.cuda_ctx = None
+            self._owns_cuda_context = False
 
     def _load_engine(self):
         """加载 TensorRT 引擎并创建执行上下文"""
@@ -957,32 +962,68 @@ class TRTPoseDetector:
             self.detect_keypoints(dummy)
         logger.info("TensorRT 预热完成")
 
-    def __del__(self):
-        """清理资源"""
-        try:
-            # 确保在正确的上下文中释放资源
-            if self.cuda_ctx:
-                self.cuda_ctx.push()
+    def close(self):
+        """释放 TensorRT/PyCUDA 资源并弹出自建 CUDA 上下文"""
+        if self._closed:
+            return
+        self._closed = True
 
-            # 释放 CUDA 内存
+        ctx_push_count = 0
+        try:
+            if self.cuda_ctx:
+                try:
+                    current_ctx = cuda.Context.get_current()
+                except Exception:
+                    current_ctx = None
+
+                if current_ctx is not self.cuda_ctx:
+                    try:
+                        self.cuda_ctx.push()
+                        ctx_push_count += 1
+                    except Exception:
+                        pass
+
             for cuda_mem in self.cuda_inputs + self.cuda_outputs:
                 try:
                     cuda_mem.free()
                 except Exception:
                     pass
+            self.cuda_inputs = []
+            self.cuda_outputs = []
 
-            # 销毁上下文和引擎
             if self.context:
-                del self.context
+                try:
+                    del self.context
+                except Exception:
+                    pass
+                self.context = None
             if self.engine:
-                del self.engine
+                try:
+                    del self.engine
+                except Exception:
+                    pass
+                self.engine = None
 
-            # 如果是我们创建的上下文，销毁它
-            if self.cuda_ctx:
+            if ctx_push_count:
                 try:
                     self.cuda_ctx.pop()
                 except Exception:
                     pass
 
+            if self.cuda_ctx and self._owns_cuda_context:
+                try:
+                    self.cuda_ctx.pop()
+                except Exception:
+                    pass
+                try:
+                    self.cuda_ctx.detach()
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(f"TRTPoseDetector 资源清理时出错: {e}")
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

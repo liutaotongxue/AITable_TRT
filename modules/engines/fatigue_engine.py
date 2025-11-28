@@ -4,6 +4,8 @@
 
 封装疲劳检测推理逻辑（FaceMesh TensorRT），包含延迟统计。
 """
+from __future__ import annotations  # Python 3.8 兼容
+
 import time
 from typing import Optional, Dict, Any
 from dataclasses import dataclass

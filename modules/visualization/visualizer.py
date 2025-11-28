@@ -43,7 +43,7 @@ class EnhancedVisualizer:
         # 初始化时间历史记录队列
         self.time_history = deque(maxlen=Constants.HISTORY_DISPLAY_LENGTH)
         
-    def draw_visualization(self, image: np.ndarray, results: Dict, model_info: str = "YOLOv8n-Face") -> np.ndarray:
+    def draw_visualization(self, image: np.ndarray, results: Dict, model_info: str = "Pose Tracker") -> np.ndarray:
         """
         绘制可视化效果 ，增强显示
 
@@ -55,17 +55,18 @@ class EnhancedVisualizer:
         返回:
             带有可视化效果的图像
         """
-        # 检查 LOST 状态：主角暂时丢失时不画旧框，直接显示"No Face Detected"
-        quality = results.get('quality', '') if results else ''
-        if quality and quality.lower() == 'lost':
+        # 统一从顶层获取 quality（FULL / BODY_ONLY / FACE_ONLY / LOST）
+        if not results:
             return self.draw_no_detection(image, model_info)
 
-        # 如果没有检测结果，显示无检测画面
-        if not results or not results.get('detection'):
+        quality = results.get('quality', 'LOST')
+        detection = results.get('detection')
+
+        # 只在 LOST 或无 detection 时显示"无检测"
+        if quality == 'LOST' or not detection:
             return self.draw_no_detection(image, model_info)
-        
+
         # 提取各项检测结果
-        detection = results['detection']
         distance = results.get('stable_distance')  # 稳定距离
         raw_distance = results.get('raw_distance')  # 原始距离
         depth_available = results.get('depth_available', False)  # 深度数据是否可用
@@ -75,49 +76,61 @@ class EnhancedVisualizer:
         fatigue_enabled = results.get('fatigue_enabled', False)  # 疲劳检测是否启用
         pose = results.get('pose')  # 姿态检测结果
         pose_enabled = results.get('pose_enabled', False)  # 姿态检测是否启用
-        
-        # 1. 绘制检测框（质量感知）
-        bbox = detection['bbox']
-        bbox_type = detection.get('bbox_type', 'face')  # 默认为 face
-        quality = detection.get('quality', None)
 
-        # 根据 bbox 类型和质量选择颜色和标签
-        if bbox_type == 'person' or quality == 'BODY_ONLY':
-            # BODY_ONLY 模式：黄色人体框
-            color = (0, 255, 255)  # 黄色
-            label = "BODY"
+        # 1. 提取框信息（face_bbox + person_bbox，quality 已在顶层）
+        face_bbox = detection.get('face_bbox')
+        person_bbox = detection.get('person_bbox')
+
+        # 2. 绘制人体框（如果存在，先画以便脸框覆盖在上面）
+        if person_bbox:
+            p_x1, p_y1 = person_bbox['x1'], person_bbox['y1']
+            p_x2, p_y2 = person_bbox['x2'], person_bbox['y2']
+            # 青色实线人体框
+            cv2.rectangle(image, (p_x1, p_y1), (p_x2, p_y2), (255, 255, 0), 2)
+            cv2.putText(image, "PERSON", (p_x1, p_y1 - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+        # 3. 绘制脸部框（如果存在）
+        if face_bbox:
+            f_x1, f_y1 = face_bbox['x1'], face_bbox['y1']
+            f_x2, f_y2 = face_bbox['x2'], face_bbox['y2']
+            # 深度可用时为绿色，否则为橙色
+            face_color = (0, 255, 0) if depth_available else (0, 165, 255)
+            cv2.rectangle(image, (f_x1, f_y1), (f_x2, f_y2), face_color, 2)
+            cv2.putText(image, "FACE", (f_x1, f_y1 - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, face_color, 2)
+
+        # 4. 确定主框（用于后续计算，如中心点）
+        if quality == 'BODY_ONLY':
+            bbox = person_bbox
         else:
-            # FULL/FACE_ONLY 模式：深度可用时为绿色，否则为橙色
-            color = (0, 255, 0) if depth_available else (0, 165, 255)
-            label = "FACE"
+            bbox = face_bbox or person_bbox
 
-        cv2.rectangle(image, (bbox['x1'], bbox['y1']), (bbox['x2'], bbox['y2']), color, 2)
-
-        # 在 bbox 左上角显示类型标签
-        cv2.putText(image, label, (bbox['x1'], bbox['y1'] - 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-        # 2. 绘制眼睛位置标记（仅在有眼睛数据时）
+        # 5. 绘制眼睛位置标记（仅在有眼睛数据时）
         left_eye = detection.get('left_eye')
         right_eye = detection.get('right_eye')
 
         if left_eye is not None and right_eye is not None:
-            # 左眼：深度可用时为蓝色，否则为灰色
+            # COCO 使用被摄者视角：left_eye=被摄者左眼，right_eye=被摄者右眼
+            # 在屏幕上显示时，被摄者左眼在观看者右侧，所以标签需要交换
+            # 左眼（被摄者）：深度可用时为蓝色，否则为灰色
             left_eye_color = (255, 0, 0) if depth_available else (128, 128, 128)
-            # 右眼：深度可用时为绿色，否则为灰色
+            # 右眼（被摄者）：深度可用时为绿色，否则为灰色
             right_eye_color = (0, 255, 0) if depth_available else (128, 128, 128)
 
             # 绘制眼睛圆点
             cv2.circle(image, left_eye, 8, left_eye_color, -1)
             cv2.circle(image, right_eye, 8, right_eye_color, -1)
 
-            # 眼睛标签（L表示左眼，R表示右眼）
-            cv2.putText(image, "L", (left_eye[0]-15, left_eye[1]-15),
+            # 眼睛标签（使用观看者视角：屏幕左侧显示"L"，右侧显示"R"）
+            # left_eye 是被摄者左眼，在屏幕右侧，标记为"R"（观看者右边）
+            # right_eye 是被摄者右眼，在屏幕左侧，标记为"L"（观看者左边）
+            cv2.putText(image, "R", (left_eye[0]-15, left_eye[1]-15),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, left_eye_color, 2)
-            cv2.putText(image, "R", (right_eye[0]-15, right_eye[1]-15),
+            cv2.putText(image, "L", (right_eye[0]-15, right_eye[1]-15),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, right_eye_color, 2)
-        else:
-            # BODY_ONLY 模式：在 bbox 中心绘制一个标记表示追踪中心
+        elif quality == 'BODY_ONLY' and bbox:
+            # BODY_ONLY 模式且无眼睛数据：在 bbox 中心绘制一个标记
             cx = (bbox['x1'] + bbox['x2']) // 2
             cy = (bbox['y1'] + bbox['y2']) // 2
             cv2.circle(image, (cx, cy), 10, (0, 255, 255), 2)  # 黄色空心圆
@@ -300,9 +313,9 @@ class EnhancedVisualizer:
         cv2.putText(image, info_text, (10, 40),
                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
         
-        # 第二行：检测置信度 
+        # 第二行：检测置信度
         if 'confidence' in detection:
-            conf_text = f"Face Detection: {detection['confidence']:.3f}"
+            conf_text = f"Detection: {detection['confidence']:.3f}"
             cv2.putText(image, conf_text, (10, 80),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
     
@@ -389,25 +402,25 @@ class EnhancedVisualizer:
         h, w = image.shape[:2]
         
         # 主要提示文本
-        text = "No Face Detected"
+        text = "No Person Detected"
         font_scale = 1.5
         thickness = 3
-        
+
         # 计算文本尺寸
         (text_width, text_height), _ = cv2.getTextSize(
             text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
         )
-        
+
         # 计算文本位置（居中）
         text_x = (w - text_width) // 2
         text_y = h // 2
-        
+
         # 绘制主要文本
         cv2.putText(image, text, (text_x, text_y),
                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), thickness)
-        
+
         # 提示信息
-        hint = "Please face the camera"
+        hint = "Please step into view"
         cv2.putText(image, hint, (text_x - 30, text_y + 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
         
@@ -443,57 +456,51 @@ class EnhancedVisualizer:
 
         # 提取关键点数据
         # 支持两种数据格式:
-        # 1. TRTPoseDetector 格式: pose['detections'][...]['keypoints']
-        # 2. PoseEngine 格式: pose['keypoints_2d']
+        # 1. PoseEngine 格式: pose['keypoints_2d']
+        # 2. TRTPoseDetector 格式: pose['detections'][...]['keypoints']
         keypoints = {}
         angles = pose.get('angles', {}) if isinstance(pose, dict) else {}
 
-        if isinstance(pose, dict) and 'detections' in pose and pose['detections']:
-            # TRTPoseDetector 格式 - 多人场景下选择与人脸最匹配的检测
-            detections = pose['detections']
-            best_det = self._find_best_matching_pose(detections, detection)
-
-            if best_det is None:
-                return
-
-            kps = best_det.get('keypoints', [])
-
-            # YOLO Pose COCO 17-keypoint indices
-            # 0: nose, 1: left_eye, 2: right_eye, 5: left_shoulder, 6: right_shoulder
-            keypoint_map = {
-                0: 'nose',
-                1: 'left_eye',
-                2: 'right_eye',
-                5: 'left_shoulder',
-                6: 'right_shoulder'
-            }
-
-            for kp in kps:
-                idx = kp.get('index', -1)
-                if idx in keypoint_map and kp.get('confidence', 0) > 0.3:
-                    keypoints[keypoint_map[idx]] = {
-                        'x': int(kp['x']),
-                        'y': int(kp['y']),
-                        'confidence': kp['confidence']
-                    }
-
-        elif isinstance(pose, dict) and 'keypoints_2d' in pose:
-            # PoseEngine 格式
-            # 注意: PoseEngine 使用 left_eye_center/right_eye_center 而不是 left_eye/right_eye
+        # 先用 PoseEngine 的 keypoints_2d（保证总有一套关键点）
+        if isinstance(pose, dict) and 'keypoints_2d' in pose:
             name_mapping = {
                 'left_eye_center': 'left_eye',
                 'right_eye_center': 'right_eye',
             }
-            kps_2d = pose['keypoints_2d']
-            for name, coords in kps_2d.items():
+            for name, coords in pose['keypoints_2d'].items():
                 if coords and isinstance(coords, tuple) and len(coords) >= 2:
-                    # 统一命名
                     display_name = name_mapping.get(name, name)
                     keypoints[display_name] = {
                         'x': int(coords[0]),
                         'y': int(coords[1]),
                         'confidence': 1.0
                     }
+
+        # 再用 TRTPoseDetector 的匹配结果更新（优先与当前 detection 对齐）
+        if isinstance(pose, dict) and 'detections' in pose and pose['detections']:
+            detections = pose['detections']
+            best_det = self._find_best_matching_pose(detections, detection)
+
+            if best_det is not None:
+                kps = best_det.get('keypoints', [])
+
+                # YOLO Pose COCO 17-keypoint indices
+                keypoint_map = {
+                    0: 'nose',
+                    1: 'left_eye',
+                    2: 'right_eye',
+                    5: 'left_shoulder',
+                    6: 'right_shoulder'
+                }
+
+                for kp in kps:
+                    idx = kp.get('index', -1)
+                    if idx in keypoint_map and kp.get('confidence', 0) > 0.3:
+                        keypoints[keypoint_map[idx]] = {
+                            'x': int(kp['x']),
+                            'y': int(kp['y']),
+                            'confidence': kp['confidence']
+                        }
 
         if not keypoints:
             return
@@ -558,15 +565,19 @@ class EnhancedVisualizer:
         if len(detections) == 1:
             return detections[0]
 
-        if not face_detection or 'bbox' not in face_detection:
-            # 没有人脸信息，返回第一个检测
+        if not face_detection:
+            # 没有检测信息，返回第一个检测
             return detections[0]
 
-        face_bbox = face_detection['bbox']
-        fx1, fy1 = face_bbox['x1'], face_bbox['y1']
-        fx2, fy2 = face_bbox['x2'], face_bbox['y2']
-        face_cx = (fx1 + fx2) / 2
-        face_cy = (fy1 + fy2) / 2
+        # 优先 face_bbox，其次 person_bbox
+        ref_bbox = (face_detection.get('face_bbox') or
+                    face_detection.get('person_bbox'))
+        if not ref_bbox:
+            return detections[0]
+        fx1, fy1 = ref_bbox['x1'], ref_bbox['y1']
+        fx2, fy2 = ref_bbox['x2'], ref_bbox['y2']
+        ref_cx = (fx1 + fx2) / 2
+        ref_cy = (fy1 + fy2) / 2
 
         # 收集所有候选及其评分
         candidates = []
@@ -586,7 +597,7 @@ class EnhancedVisualizer:
                 # 计算中心距离（归一化）
                 pose_cx = (px1 + px2) / 2
                 pose_cy = (py1 + py2) / 2
-                center_dist = ((pose_cx - face_cx) ** 2 + (pose_cy - face_cy) ** 2) ** 0.5
+                center_dist = ((pose_cx - ref_cx) ** 2 + (pose_cy - ref_cy) ** 2) ** 0.5
 
                 # 检测置信度
                 confidence = det.get('confidence', 0.5)
@@ -614,7 +625,7 @@ class EnhancedVisualizer:
             for kp in kps:
                 if kp.get('index') == 0 and kp.get('confidence', 0) > 0.3:  # nose
                     nose_x, nose_y = kp['x'], kp['y']
-                    dist = ((nose_x - face_cx) ** 2 + (nose_y - face_cy) ** 2) ** 0.5
+                    dist = ((nose_x - ref_cx) ** 2 + (nose_y - ref_cy) ** 2) ** 0.5
                     if dist < best_dist:
                         best_dist = dist
                         best_det = det
@@ -870,11 +881,13 @@ if __name__ == "__main__":
     # 创建测试数据
     test_results = {
         'detection': {
-            'bbox': {'x1': 400, 'y1': 200, 'x2': 600, 'y2': 400},
+            'face_bbox': {'x1': 400, 'y1': 200, 'x2': 600, 'y2': 400},
+            'person_bbox': None,
+            'quality': 'FACE_ONLY',
             'left_eye': (450, 280),
             'right_eye': (550, 280),
             'confidence': 0.95,
-            'method': 'YOLOv8'
+            'method': 'Pose Tracker',
         },
         'stable_distance': 0.5,
         'raw_distance': 0.48,

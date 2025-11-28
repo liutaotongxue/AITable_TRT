@@ -118,33 +118,32 @@ class DetectionOrchestrator:
         # ROI 管理器（统一的人脸裁剪逻辑）
         self.roi_manager = ROIManager(margin=0.0, min_size=20)
 
-        # ========== SimpleTracker 初始化 ==========
-        self.tracker = None
-        self.tracking_enabled = False
+        # ========== SimpleTracker 初始化（必需组件）==========
+        # 系统仅支持 Pose+Tracker 路径，face-only 模式已移除
+        if not _TRACKER_AVAILABLE:
+            raise RuntimeError(
+                "SimpleTracker 模块不可用，系统无法启动。\n"
+                "请确保 modules/tracking/simple_tracker.py 存在且可导入。"
+            )
+        if not self.pose_detector:
+            raise RuntimeError(
+                "pose_detector 未提供，系统无法启动。\n"
+                "DetectionOrchestrator 必须传入 pose_detector 参数。"
+            )
 
         tracking_cfg = self.system_config.get('tracking', {})
-        _tracking_cfg_enabled = tracking_cfg.get('enabled', False)
-
-        if _tracking_cfg_enabled and _TRACKER_AVAILABLE and self.pose_detector:
-            try:
-                self.tracker = SimpleTracker(
-                    depth_range_mm=(
-                        tracking_cfg.get('depth_range_min', 200),
-                        tracking_cfg.get('depth_range_max', 1500)
-                    ),
-                    switch_depth_delta_mm=tracking_cfg.get('switch_depth_delta_mm', 100),
-                    min_keep_frames=tracking_cfg.get('min_keep_frames', 15),
-                )
-                self.tracking_enabled = True
-                logger.info("SimpleTracker 初始化成功")
-            except Exception as e:
-                logger.warning(f"SimpleTracker 初始化失败: {e}")
-                self.tracker = None
-                self.tracking_enabled = False
-        elif _tracking_cfg_enabled and not _TRACKER_AVAILABLE:
-            logger.warning("tracking 模块不可用，使用原 Face 检测模式")
-        elif _tracking_cfg_enabled and not self.pose_detector:
-            logger.warning("pose_detector 未提供，无法启用追踪模式")
+        try:
+            self.tracker = SimpleTracker(
+                depth_range_mm=(
+                    tracking_cfg.get('depth_range_min', 200),
+                    tracking_cfg.get('depth_range_max', 1500)
+                ),
+                switch_depth_delta_mm=tracking_cfg.get('switch_depth_delta_mm', 100),
+                min_keep_frames=tracking_cfg.get('min_keep_frames', 15),
+            )
+            logger.info("SimpleTracker 初始化成功（Pose+Tracker 模式）")
+        except Exception as e:
+            raise RuntimeError(f"SimpleTracker 初始化失败: {e}")
         # ==========================================
 
         # 帧率监控器（替代手动 FPS 计算）
@@ -163,7 +162,8 @@ class DetectionOrchestrator:
         async_config = self.system_config.get('performance', {}).get('async_inference', {})
         async_enabled = async_config.get('enabled', False)
 
-        if async_enabled and all([emotion_engine, fatigue_engine, pose_engine]):
+        # 只要 pose_engine 存在就允许异步（情绪/疲劳引擎可选）
+        if async_enabled and pose_engine is not None:
             scheduler_config = SchedulerConfig(
                 enabled=True,
                 max_queue_size=async_config.get('max_queue_size', 1),
@@ -171,16 +171,16 @@ class DetectionOrchestrator:
             )
 
             self.inference_scheduler = InferenceScheduler(
-                emotion_engine=emotion_engine,
-                fatigue_engine=fatigue_engine,
+                emotion_engine=emotion_engine,  # 可为 None
+                fatigue_engine=fatigue_engine,  # 可为 None
                 pose_engine=pose_engine,
                 config=scheduler_config
             )
             self.async_enabled = True
-            logger.info("DetectionOrchestrator: 异步推理已启用")
+            logger.info("DetectionOrchestrator: 异步推理已启用 (pose_engine 必需，emotion/fatigue 可选)")
         else:
             if async_enabled:
-                logger.warning("DetectionOrchestrator: 异步推理配置为启用，但缺少必需的引擎，回退到同步模式")
+                logger.warning("DetectionOrchestrator: 异步推理配置为启用，但缺少 pose_engine，回退到同步模式")
             logger.info("DetectionOrchestrator: 使用同步推理模式")
 
         # ========== 配置参数 ==========
@@ -197,8 +197,8 @@ class DetectionOrchestrator:
 
         # 注意：去抖阈值、空帧计数等已移至 WindowManager 管理
 
-        logger.info("DetectionOrchestrator: 已初始化")
-        logger.info(f"  - 追踪模式: {'启用' if self.tracking_enabled else '禁用'}")
+        logger.info("DetectionOrchestrator: 已初始化（Pose+Tracker 模式）")
+        logger.info("  - 追踪模式: 强制启用（face-only 已移除）")
         logger.info(f"  - 情绪检测: {'启用' if emotion_engine else '禁用'}")
         logger.info(f"  - 疲劳检测: {'启用' if fatigue_engine else '禁用'}")
         logger.info(f"  - 姿态检测: {'启用' if pose_engine else '禁用'}")
@@ -316,65 +316,88 @@ class DetectionOrchestrator:
                         continue
                     # 帧解码成功（无效帧计数可选重置，这里不重置因为WindowManager已管理）
 
-                    # ========== 单帧检测流程 ==========
+                    # ========== 单帧检测流程（仅 Pose+Tracker 路径）==========
                     results = None
                     vis_from_system = None
                     current_face_detected = False
                     face_bbox = None
                     face_roi = None
                     face_appeared = False
+                    person_bbox = None  # 用于 PoseEngine 计算 3D 坐标
+                    person_roi = None   # PoseEngine 需要的 RegionROI 对象
 
-                    # ========== SimpleTracker 模式 vs Face 检测模式 ==========
-                    if self.tracking_enabled and self.tracker:
-                        # --- SimpleTracker 模式 ---
-                        pose_raw = self.pose_detector.detect_keypoints(rgb_frame)
+                    # Pose 检测 → Tracker 更新
+                    pose_raw = self.pose_detector.detect_keypoints(rgb_frame)
 
-                        if pose_raw and pose_raw.get('detections'):
-                            self.tracker.update(pose_raw['detections'], depth_frame)
-                        else:
-                            self.tracker.update([], depth_frame)
-
-                        target = self.tracker.get_primary_target()
-
-                        if target:
-                            current_face_detected = True
-                            face_appeared = not self.previous_face_detected
-
-                            results, vis_from_system = self._process_with_tracker_target(
-                                target, rgb_frame, depth_frame
-                            )
-
-                            if target.face_valid and target.face_bbox:
-                                x1, y1, x2, y2 = target.face_bbox
-                                face_bbox = {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y2)}
-                            elif target.bbox:
-                                x1, y1, x2, y2 = target.bbox
-                                head_h = (y2 - y1) / 6
-                                face_bbox = {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y1 + head_h)}
-
-                            if face_bbox:
-                                rois = self.roi_manager.extract_dual(rgb_frame, face_bbox=face_bbox, person_bbox=None)
-                                face_roi = rois.get('face_roi')
-                        else:
-                            vis_from_system = self.system.visualizer.draw_no_detection(rgb_frame.copy(), "Tracker")
-                            self.previous_face_detected = False
-
+                    if pose_raw and pose_raw.get('detections'):
+                        self.tracker.update(pose_raw['detections'], depth_frame)
                     else:
-                        # --- 原 Face 检测模式 ---
-                        detection = self.system.face_detector.detect_face(rgb_frame)
+                        self.tracker.update([], depth_frame)
 
-                        if detection:
-                            current_face_detected = True
-                            face_bbox = detection['bbox']
-                            face_appeared = not self.previous_face_detected
-                            results, vis_from_system = self.system.process_frame(rgb_frame, depth_frame)
+                    target = self.tracker.get_primary_target()
 
-                            if face_bbox:
-                                rois = self.roi_manager.extract_dual(rgb_frame, face_bbox=face_bbox, person_bbox=None)
-                                face_roi = rois.get('face_roi')
-                        else:
-                            vis_from_system = self.system.visualizer.draw_no_detection(rgb_frame.copy(), "YOLO")
-                            self.previous_face_detected = False
+                    if target:
+                        current_face_detected = True
+                        face_appeared = not self.previous_face_detected
+
+                        results, vis_from_system = self._process_with_tracker_target(
+                            target, rgb_frame, depth_frame
+                        )
+
+                        # 从 tracker 获取 face_bbox（用于情绪/疲劳 ROI）
+                        if target.face_valid and target.face_bbox:
+                            x1, y1, x2, y2 = target.face_bbox
+                            face_bbox = {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y2)}
+                        elif target.bbox:
+                            # 从人体框估算头部区域
+                            x1, y1, x2, y2 = target.bbox
+                            head_h = (y2 - y1) / 6
+                            face_bbox = {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y1 + head_h)}
+
+                        # 从 target 获取 person_bbox（用于 PoseEngine 计算 3D 坐标和姿态角度）
+                        if target.bbox:
+                            px1, py1, px2, py2 = target.bbox
+                            person_bbox = {'x1': int(px1), 'y1': int(py1), 'x2': int(px2), 'y2': int(py2)}
+
+                        # 使用 ROIManager 提取 face_roi 和 person_roi
+                        # PoseEngine 需要 person_roi（RegionROI 对象）来计算 3D 坐标
+                        if face_bbox or person_bbox:
+                            rois = self.roi_manager.extract_dual(rgb_frame, face_bbox=face_bbox, person_bbox=person_bbox)
+                            face_roi = rois.get('face_roi')
+                            person_roi = rois.get('person_roi')  # PoseEngine 需要这个
+
+                        # [DEBUG] 诊断日志（每 50 帧打印一次）
+                        if self.system.frame_count % 50 == 0:
+                            logger.info(
+                                f"[DEBUG] frame={self.system.frame_count} | "
+                                f"person_bbox={'SET' if person_bbox else 'None'} | "
+                                f"person_roi={'SET' if person_roi else 'None'} | "
+                                f"face_present={current_face_detected}"
+                            )
+                    else:
+                        # 无 target：构建 LOST 状态
+                        self._lost_frame_count = getattr(self, '_lost_frame_count', 0) + 1
+                        if self._lost_frame_count == 1 or self._lost_frame_count % 100 == 0:
+                            logger.warning(
+                                f"[LOST] 连续 {self._lost_frame_count} 帧无目标，"
+                                "请检查 pose 模型/光照/遮挡/置信度阈值"
+                            )
+                        results = {
+                            'frame': self.system.frame_count,
+                            'quality': 'LOST',
+                            'detection': None,
+                            'raw_distance': None,
+                            'stable_distance': None,
+                            'depth_available': False,
+                        }
+                        vis_from_system = self.system.visualizer.draw_visualization(
+                            rgb_frame.copy(), results, "Pose Tracker"
+                        )
+                        self.previous_face_detected = False
+
+                    # 有目标时重置 LOST 计数
+                    if target:
+                        self._lost_frame_count = 0
 
                     # ========== 推理执行（同步/异步分支）==========
                     if self.async_enabled and self.inference_scheduler:
@@ -389,8 +412,8 @@ class DetectionOrchestrator:
                             frame_count=self.system.frame_count,
                             global_frame_interval=self.global_frame_interval,
                             global_fps=self.global_fps,
-                            person_roi=None,
-                            person_bbox=None
+                            person_roi=person_roi,   # PoseEngine 需要 RegionROI 对象
+                            person_bbox=person_bbox  # 传递 person_bbox 用于 3D 坐标计算
                         )
 
                         # 收集最新结果
@@ -464,8 +487,8 @@ class DetectionOrchestrator:
                                 global_frame_interval=self.global_frame_interval,
                                 frame_count=self.system.frame_count,
                                 global_fps=self.global_fps,
-                                person_roi=None,
-                                person_bbox=None
+                                person_roi=person_roi,   # PoseEngine 需要 RegionROI 对象
+                                person_bbox=person_bbox  # 传递 person_bbox 用于 3D 坐标计算
                             )
                             pose_results = pose_result.data
 
@@ -481,19 +504,48 @@ class DetectionOrchestrator:
                         results['emotion_speed_fps'] = emotion_speed_fps if emotion_speed_fps > 0 else None
                         results['fatigue'] = fatigue_results
                         results['fatigue_enabled'] = self.fatigue_engine is not None
-                        results['pose'] = pose_results
+                        # 保持 pose 字段为字典，避免后续链式 get 在 pose=None 时异常
+                        results['pose'] = pose_results or {}
                         results['pose_enabled'] = self.pose_engine is not None
 
+                        # [DEBUG] 诊断 pose_results 内容（每 50 帧打印一次）
+                        if self.system.frame_count % 50 == 0:
+                            if pose_results:
+                                has_kp3d = 'keypoints_3d' in pose_results and pose_results['keypoints_3d']
+                                status = pose_results.get('status', 'unknown')
+                                logger.info(
+                                    f"[DEBUG pose_results] frame={self.system.frame_count} | "
+                                    f"status={status} | "
+                                    f"has_keypoints_3d={has_kp3d}"
+                                )
+                            else:
+                                logger.info(f"[DEBUG pose_results] frame={self.system.frame_count} | pose_results=None")
+
+                        # 添加原始 pose 检测结果（用于骨架绘制）
+                        # pose_raw 包含 TRTPoseDetector 的 2D keypoints，visualizer 需要这些数据画骨架
+                        if pose_raw and pose_raw.get('detections'):
+                            if results is None:
+                                results = {}
+                            if results.get('pose') is None:
+                                results['pose'] = {}
+                            results['pose']['detections'] = pose_raw['detections']
+
                         # 添加全局和相机 FPS
+                        if results is None:
+                            continue
                         results['global_fps'] = self.global_fps if self.global_fps > 0 else None
                         results['camera_fps'] = self.system.camera.camera_fps if self.system.camera.camera_fps > 0 else None
 
                         # ========== 创建 telemetry ==========
+                        if results is None:
+                            continue
                         stable_dist = results.get("stable_distance")
 
                         # 计算肩部中点
-                        left_shoulder = results.get("pose", {}).get("keypoints_3d", {}).get("left_shoulder")
-                        right_shoulder = results.get("pose", {}).get("keypoints_3d", {}).get("right_shoulder")
+                        pose_data = results.get("pose") or {}
+                        keypoints_3d = pose_data.get("keypoints_3d") or {}
+                        left_shoulder = keypoints_3d.get("left_shoulder")
+                        right_shoulder = keypoints_3d.get("right_shoulder")
                         shoulder_midpoint = None
                         shoulder_midpoint_to_desk = None
 
@@ -534,7 +586,7 @@ class DetectionOrchestrator:
                                 )
                             else:
                                 self.visualization = self.system.visualizer.draw_visualization(
-                                    rgb_frame.copy(), results, "YOLO Face Model"
+                                    rgb_frame.copy(), results, "Pose Tracker"
                                 )
                         else:
                             self.visualization = vis_from_system
@@ -606,6 +658,12 @@ class DetectionOrchestrator:
                     self.paused = self.window_manager.is_paused()
 
                     # 检查退出状态
+                    if status == "quit":
+                        break
+
+                # UI 关闭时也进行轻量键盘轮询，允许 'v' 再次打开或 'q' 退出
+                if self.window_manager and not self.window_manager.enabled:
+                    status = self.window_manager.poll_keys_and_health()
                     if status == "quit":
                         break
 
@@ -686,34 +744,53 @@ class DetectionOrchestrator:
         process_time = time.time() - start_time
         self.system.processing_times.append(process_time)
 
-        # 构建 detection
-        detection = None
+        # 构建 detection（明确分开 face_bbox 和 person_bbox）
+        # 构建各个框
+        face_bbox_dict = None
+        person_bbox_dict = None
+
         if target.face_bbox:
-            x1, y1, x2, y2 = target.face_bbox
+            fx1, fy1, fx2, fy2 = target.face_bbox
+            face_bbox_dict = {'x1': int(fx1), 'y1': int(fy1), 'x2': int(fx2), 'y2': int(fy2)}
+
+        if target.bbox:
+            px1, py1, px2, py2 = target.bbox
+            person_bbox_dict = {'x1': int(px1), 'y1': int(py1), 'x2': int(px2), 'y2': int(py2)}
+
+        # 确定质量等级（顶层字段）
+        if face_bbox_dict and person_bbox_dict:
+            quality = 'FULL'
+        elif person_bbox_dict:
+            quality = 'BODY_ONLY'
+        elif face_bbox_dict:
+            quality = 'FACE_ONLY'
+        else:
+            quality = 'LOST'
+
+        # 只要有任何框就生成 detection
+        detection = None
+        if quality != 'LOST':
             detection = {
-                'bbox': {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y2)},
-                'confidence': target.face_confidence,
-                'left_eye': left_eye_pos, 'right_eye': right_eye_pos,
-            }
-        elif target.bbox:
-            x1, y1, x2, y2 = target.bbox
-            detection = {
-                'bbox': {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y2)},
-                'confidence': target.confidence,
-                'left_eye': left_eye_pos, 'right_eye': right_eye_pos,
+                'face_bbox': face_bbox_dict,
+                'person_bbox': person_bbox_dict,
+                'confidence': target.face_confidence if face_bbox_dict else target.confidence,
+                'left_eye': left_eye_pos,
+                'right_eye': right_eye_pos,
+                'method': 'Pose Tracker',
+                'track_id': target.track_id,
             }
 
         results = {
             'frame': self.system.frame_count,
+            'quality': quality,  # 顶层 quality
             'raw_distance': raw_distance,
             'stable_distance': stable_distance,
             'stability_score': stability_score,
             'eye_results': eye_results,
             'detection': detection,
             'process_time': process_time,
-            'fps': 1.0 / np.mean(self.system.processing_times) if self.system.processing_times else 0,
+            'fps': self.global_fps,  # 使用 FrameRateMonitor 计算的全帧 FPS
             'depth_available': depth_available,
-            'track_id': target.track_id,
         }
 
         visualization = self.system.visualizer.draw_visualization(rgb_frame.copy(), results, "Pose Tracker")
@@ -729,6 +806,13 @@ class DetectionOrchestrator:
             errors = self.inference_scheduler.check_errors()
             if errors:
                 logger.warning(f"异步推理调度器退出时有错误: {errors}")
+
+        # 释放姿态检测器资源（确保 CUDA 上下文正确弹栈）
+        if self.pose_detector and hasattr(self.pose_detector, "close"):
+            try:
+                self.pose_detector.close()
+            except Exception as e:
+                logger.warning(f"Pose detector cleanup failed: {e}")
 
         # 取消订阅可视化开关
         if self._unsubscribe:

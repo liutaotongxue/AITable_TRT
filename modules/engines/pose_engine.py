@@ -10,6 +10,7 @@
 - One-Euro 滤波角度计算
 - 性能监控（EMA 延迟统计）
 """
+from __future__ import annotations  # Python 3.8 兼容
 
 import time
 import os
@@ -22,6 +23,36 @@ from ..pose import (
     QUALITY_FLAG_LEFT_EYE_FALLBACK,
     QUALITY_FLAG_RIGHT_EYE_FALLBACK,
 )
+try:
+    from omegaconf import OmegaConf  # Optional dependency; may be unavailable
+except ImportError:
+    OmegaConf = None
+
+
+def _to_plain_dict(value):
+    """
+    递归将配置对象转换为普通容器，兼容自定义 DictConfig 与 OmegaConf.DictConfig。
+    非容器类型保持原样返回。
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return {k: _to_plain_dict(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_to_plain_dict(v) for v in value)
+    if isinstance(value, list):
+        return [_to_plain_dict(v) for v in value]
+    if OmegaConf and hasattr(OmegaConf, "to_container"):
+        try:
+            return OmegaConf.to_container(value, resolve=True)
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        try:
+            return {k: _to_plain_dict(v) for k, v in value.__dict__.items()}
+        except Exception:
+            pass
+    return value
 
 
 @dataclass
@@ -115,7 +146,9 @@ class PoseEngine:
         self.interval_frames = interval_frames
         self.cache_timeout = cache_timeout
         self.latency_smoothing = latency_smoothing
-        self.system_config = system_config or {}
+        # 正常化 system_config：将 DictConfig 转换为普通 dict
+        normalized_config = _to_plain_dict(system_config) if system_config is not None else {}
+        self.system_config = normalized_config if isinstance(normalized_config, dict) else {}
         self.include_full_3d_coords = include_full_3d_coords
 
         # 状态变量
@@ -235,6 +268,14 @@ class PoseEngine:
         )
 
         if should_infer:
+            # [DEBUG] 诊断日志
+            if frame_count % 50 == 0:
+                logger.info(
+                    f"[PoseEngine DEBUG] frame={frame_count} | "
+                    f"should_infer=True | "
+                    f"person_roi={'SET' if person_roi else 'None'} | "
+                    f"has_roi_rgb={hasattr(person_roi, 'roi_rgb') if person_roi else False}"
+                )
             # 执行推理
             return self._run_inference(
                 rgb_frame=rgb_frame,
@@ -247,6 +288,13 @@ class PoseEngine:
                 person_bbox=person_bbox
             )
         else:
+            # [DEBUG] 诊断日志（缓存路径）
+            if frame_count % 50 == 0:
+                logger.info(
+                    f"[PoseEngine DEBUG] frame={frame_count} | "
+                    f"should_infer=False (using cache) | "
+                    f"cache_age_ms={pose_age_ms:.1f}"
+                )
             # 使用缓存
             return self._use_cache(pose_age_ms)
 
@@ -286,8 +334,12 @@ class PoseEngine:
             else:
                 # 缺失 person_roi：返回缓存，避免在整帧重跑可能检测到其他人
                 #  保持与 EmotionEngine/FatigueEngine 一致的行为
-                if os.getenv('AITABLE_DEBUG_POSE', '0') == '1':
-                    logger.debug("[Pose] 缺失 person_roi，返回缓存（避免整帧检测可能检测到其他人）")
+                # [DEBUG] 始终打印此警告（这是 keypoints_3d 为 null 的关键原因）
+                logger.warning(
+                    f"[PoseEngine] 缺失有效 person_roi，返回缓存 | "
+                    f"person_roi={person_roi} | "
+                    f"has_roi_rgb={hasattr(person_roi, 'roi_rgb') if person_roi else False}"
+                )
 
                 return PoseResult(
                     data=self._last_result if self._last_result else {'status': 'no_person_roi'},
@@ -341,7 +393,9 @@ class PoseEngine:
                 if depth_value_mm is not None and depth_value_mm > 0:
                     point_3d = self.system.pixel_to_3d(x, y, depth_value_mm)
                     if point_3d is not None:
-                        keypoints_3d[kp_name] = point_3d
+                        # pixel_to_3d() 返回 tuple，需要转换为 numpy array
+                        # 以便后续 HeadOrientationFilter/CalculatePostureAngles 进行向量运算
+                        keypoints_3d[kp_name] = np.array(point_3d, dtype=float)
                         depth_available_count += 1
                 else:
                     keypoints_3d[kp_name] = None
@@ -428,15 +482,14 @@ class PoseEngine:
             if quality_flags.get(QUALITY_FLAG_RIGHT_EYE_FALLBACK):
                 logger.debug("姿态检测: 右眼使用耳朵回退")
 
-            # 姿态模块调试日志
-            if os.getenv('AITABLE_DEBUG_POSE', '0') == '1':
+            # [DEBUG] 推理成功日志（每 50 帧打印一次）
+            if frame_count % 50 == 0:
                 kp3d_count = pose_data.get('keypoints_3d_count', depth_available_count)
-                logger.debug(
-                    f"[Pose] frame result: keypoints_2d={len(keypoints_2d)}, "
-                    f"keypoints_3d={kp3d_count}, "
-                    f"has_shoulders={'left_shoulder' in keypoints_2d and 'right_shoulder' in keypoints_2d}, "
-                    f"has_eyes={'left_eye_center' in keypoints_2d and 'right_eye_center' in keypoints_2d}, "
-                    f"status={pose_data.get('status', 'unknown')}"
+                logger.info(
+                    f"[PoseEngine SUCCESS] frame={frame_count} | "
+                    f"keypoints_2d={len(keypoints_2d)} | "
+                    f"keypoints_3d={kp3d_count} | "
+                    f"has_angles={angles is not None}"
                 )
 
             # 更新缓存
@@ -491,8 +544,8 @@ class PoseEngine:
             try:
                 # 持久化姿态角度计算器（首次初始化或更新关键点）
                 if self._pose_angle_calculator is None:
-                    # 首次初始化：可选从 system_config.json 读取 One-Euro 参数
-                    oneeuro_params = self.system_config.get("pose_angles", {}).get("oneeuro_params", None)
+                    # 从 system_config 读取 One-Euro 参数（已在 __init__ 中正常化为普通 dict）
+                    oneeuro_params = self._get_oneeuro_params()
                     self._pose_angle_calculator = CalculatePostureAngles(
                         keypoints_3d,
                         smoothing_factor=0.9,
@@ -552,6 +605,16 @@ class PoseEngine:
                 angles_fallback_status['error'] = str(e)
 
         return angles, angles_fallback_status
+
+    def _get_oneeuro_params(self) -> Optional[Dict[str, Any]]:
+        """从配置中提取并规范化 One-Euro 参数，返回普通字典或 None。"""
+        params = None
+        if isinstance(self.system_config, dict):
+            params = self.system_config.get("pose_angles", {}).get("oneeuro_params")
+        if params is None:
+            return None
+        normalized = _to_plain_dict(params)
+        return normalized if isinstance(normalized, dict) else None
 
     def _log_performance(
         self,

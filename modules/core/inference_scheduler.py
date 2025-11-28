@@ -2,6 +2,7 @@
 推理调度器
 统一管理多个异步推理引擎，协调任务提交和结果收集
 """
+from __future__ import annotations  # Python 3.8 兼容
 
 import time
 import numpy as np
@@ -70,30 +71,38 @@ class InferenceScheduler:
 
         logger.info("[InferenceScheduler] Initializing async inference schedulers")
 
-        # 创建异步执行器
+        # 创建异步执行器（只为非 None 引擎创建）
         self.runners: Dict[str, AsyncEngineRunner] = {}
 
-        # Emotion Runner
-        self.runners['emotion'] = AsyncEngineRunner(
-            engine=emotion_engine,
-            engine_name='EmotionEngine',
-            should_infer_func=self._should_infer_emotion,
-            infer_func=self._infer_emotion,
-            max_queue_size=config.max_queue_size,
-            enable_logging=config.enable_detailed_logging
-        )
+        # Emotion Runner（可选）
+        if emotion_engine is not None:
+            self.runners['emotion'] = AsyncEngineRunner(
+                engine=emotion_engine,
+                engine_name='EmotionEngine',
+                should_infer_func=self._should_infer_emotion,
+                infer_func=self._infer_emotion,
+                max_queue_size=config.max_queue_size,
+                enable_logging=config.enable_detailed_logging
+            )
+            logger.info("[InferenceScheduler] EmotionEngine runner created")
+        else:
+            logger.info("[InferenceScheduler] EmotionEngine disabled (None)")
 
-        # Fatigue Runner
-        self.runners['fatigue'] = AsyncEngineRunner(
-            engine=fatigue_engine,
-            engine_name='FatigueEngine',
-            should_infer_func=self._should_infer_fatigue,
-            infer_func=self._infer_fatigue,
-            max_queue_size=config.max_queue_size,
-            enable_logging=config.enable_detailed_logging
-        )
+        # Fatigue Runner（可选）
+        if fatigue_engine is not None:
+            self.runners['fatigue'] = AsyncEngineRunner(
+                engine=fatigue_engine,
+                engine_name='FatigueEngine',
+                should_infer_func=self._should_infer_fatigue,
+                infer_func=self._infer_fatigue,
+                max_queue_size=config.max_queue_size,
+                enable_logging=config.enable_detailed_logging
+            )
+            logger.info("[InferenceScheduler] FatigueEngine runner created")
+        else:
+            logger.info("[InferenceScheduler] FatigueEngine disabled (None)")
 
-        # Pose Runner
+        # Pose Runner（必需）
         self.runners['pose'] = AsyncEngineRunner(
             engine=pose_engine,
             engine_name='PoseEngine',
@@ -102,8 +111,9 @@ class InferenceScheduler:
             max_queue_size=config.max_queue_size,
             enable_logging=config.enable_detailed_logging
         )
+        logger.info("[InferenceScheduler] PoseEngine runner created")
 
-        logger.info("[InferenceScheduler] All async runners initialized")
+        logger.info(f"[InferenceScheduler] Async runners initialized: {list(self.runners.keys())}")
 
     def start(self):
         """启动所有异步执行器"""
@@ -191,16 +201,17 @@ class InferenceScheduler:
         # 注意：should_infer 判断在后台线程中进行，这里直接提交
         # 如果队列满，submit() 会自动丢弃
 
-        # Emotion: 只在有人脸时提交
-        if face_present:
+        # Emotion: 只在有人脸且引擎存在时提交
+        if face_present and 'emotion' in self.runners:
             self.runners['emotion'].submit(task)
 
-        # Fatigue: 只在有人脸时提交
-        if face_present:
+        # Fatigue: 只在有人脸且引擎存在时提交
+        if face_present and 'fatigue' in self.runners:
             self.runners['fatigue'].submit(task)
 
         # Pose: 始终提交（内部会根据face_present判断）
-        self.runners['pose'].submit(task)
+        if 'pose' in self.runners:
+            self.runners['pose'].submit(task)
 
     def collect_results(self) -> Dict[str, Any]:
         """

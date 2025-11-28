@@ -4,6 +4,8 @@
 
 封装情绪识别推理逻辑，包含降频、缓存和延迟统计。
 """
+from __future__ import annotations  # Python 3.8 兼容
+
 import time
 from typing import Optional, Dict, Any
 from dataclasses import dataclass

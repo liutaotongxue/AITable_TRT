@@ -5,6 +5,8 @@
 封装 OpenCV 窗口创建、显示、键盘处理和健康检查逻辑。
 """
 import os
+import sys
+import select
 import cv2
 import time
 from datetime import datetime
@@ -154,6 +156,18 @@ class WindowManager:
                  "paused" - 已暂停（仅状态信息）
         """
         if not self.enabled:
+            # 轻量级键盘轮询，仅用于捕获 'v'/'q' 热键，避免重新进入重型 UI 逻辑
+            key = cv2.waitKey(1) & 0xFF
+            if key == 0xFF:  # 无 OpenCV 按键时，尝试从 stdin 非阻塞读取一字节（无窗口时按键会跑到终端）
+                key = self._poll_hotkey_fallback()
+            if key in (ord('q'), 27):  # q / ESC
+                logger.info("退出原因: 用户按键 (q/ESC)")
+                return "quit"
+            elif key == ord('v'):  # 热切换可视化
+                if hasattr(self, '_visual_switch') and self._visual_switch:
+                    self._visual_switch.toggle(source="keyboard_v")
+                else:
+                    logger.info("按键 'v' 触发可视化切换，但未绑定 RuntimeSwitch")
             return "continue"
 
         # 键盘处理
@@ -288,8 +302,9 @@ class WindowManager:
     def disable(self):
         """热禁用窗口（运行时关闭可视化，不影响推理）"""
         if self.enabled:
-            self.enabled = False
+            # 先销毁窗口再更新状态，避免 destroy 因 enabled=False 直接返回导致窗口残留
             self.destroy()
+            self.enabled = False
             logger.info("[UI] 窗口已热禁用（推理继续运行）")
 
     def destroy(self):
@@ -420,6 +435,23 @@ class WindowManager:
             on_reset_callback=on_reset_callback,
             on_screenshot_callback=on_screenshot_callback
         )
+
+    def _poll_hotkey_fallback(self):
+        """
+        当 OpenCV 无窗口捕获键盘时，从 stdin 非阻塞读取一个字符。
+        仅用于热键 'v'/'q'，无需回显和额外 UI 开销。
+        """
+        try:
+            if not sys.stdin.isatty():
+                return 0xFF
+            rlist, _, _ = select.select([sys.stdin], [], [], 0)
+            if rlist:
+                ch = sys.stdin.read(1)
+                if ch:
+                    return ord(ch)
+        except Exception:
+            pass
+        return 0xFF
 
     def get_frame_streak(self, event_type: str) -> int:
         """

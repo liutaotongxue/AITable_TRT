@@ -12,7 +12,6 @@ from ..core import Constants, logger
 from ..camera import ImageDataProcessor
 from ..camera.depth_camera_interface import DepthCameraInterface
 from ..detection import DistanceProcessor
-from ..detection.trt_face_detector import TRTFaceDetector
 from ..visualization import EnhancedVisualizer
 
 
@@ -25,7 +24,6 @@ class EyeDistanceSystem:
     def __init__(self,
                  camera: DepthCameraInterface,
                  plane_model: Tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.25),
-                 model_path: str = 'models/yolov8n-face.engine',
                  depth_range: Tuple[float, float] = (200, 1500)):
         """
         初始化眼距监测系统
@@ -33,16 +31,16 @@ class EyeDistanceSystem:
         Args:
             camera: DepthCameraInterface 实例（必需）
             plane_model: 平面模型参数
-            model_path: TensorRT 引擎路径（必须是 .engine 文件）
             depth_range: 深度范围(毫米)
 
         Raises:
             TypeError: 如果 camera 未实现 DepthCameraInterface
-            ValueError: 如果 model_path 不是 .engine 文件
 
         注意:
-            - TensorRT-only 架构：只支持板级生成的 .engine 文件
-            - 不支持 .pt (PyTorch) 或 Ultralytics 模型
+            眼睛位置由 Pose Tracker 提供（YOLO Pose 关键点），本模块仅负责：
+            - 深度采样
+            - 3D 坐标转换
+            - 距离计算
         """
         # 验证接口类型
         if not isinstance(camera, DepthCameraInterface):
@@ -81,8 +79,7 @@ class EyeDistanceSystem:
         # 深度范围
         self.min_depth, self.max_depth = depth_range
 
-        # 初始化人脸检测器（TensorRT-only）
-        self.face_detector = self._create_face_detector(model_path)
+        # 距离处理器（平滑和稳定化）
         self.distance_processor = DistanceProcessor(Constants.SMOOTHING_WINDOW)
 
         # 从相机获取 SDK 常量，传给 ImageDataProcessor
@@ -117,54 +114,9 @@ class EyeDistanceSystem:
 
         self.resolution_updated = False
 
-        logger.info("Eye Distance System initialized")
-        logger.info(f"Face detector: {type(self.face_detector).__name__}")
+        logger.info("Eye Distance System initialized (Pose-based eye detection)")
         logger.info(f"Initial resolution: {self.rgb_width}x{self.rgb_height}")
 
-    def _create_face_detector(self, model_path: str):
-        """
-        创建 TensorRT 人脸检测器（TensorRT-only 架构）
-
-        Args:
-            model_path: TensorRT 引擎路径（必须是 .engine 文件）
-
-        Returns:
-            TRTFaceDetector 实例
-
-        Raises:
-            ValueError: 如果 model_path 不是 .engine 文件
-            RuntimeError: 如果 TRTFaceDetector 初始化失败
-
-        注意:
-            - 只支持板级生成的 TensorRT 引擎文件
-            - 不支持 .pt (PyTorch) 或 Ultralytics 模型
-        """
-        # 验证文件扩展名
-        if not model_path.endswith('.engine'):
-            raise ValueError(
-                f"TensorRT-only 架构要求: model_path 必须是 .engine 文件\n"
-                f"当前路径: {model_path}\n"
-                f"不支持 .pt (PyTorch) 或其他格式"
-            )
-
-        # 加载 TensorRT 引擎
-        logger.info(f"Loading TensorRT face detector: {model_path}")
-        try:
-            detector = TRTFaceDetector(
-                engine_path=model_path,
-                confidence_threshold=Constants.FACE_CONFIDENCE_THRESHOLD
-            )
-            logger.info("TRTFaceDetector initialized successfully")
-            return detector
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to initialize TRTFaceDetector: {e}\n"
-                f"请确认:\n"
-                f"  1. TensorRT 和 PyCUDA 已正确安装\n"
-                f"  2. .engine 文件与当前平台兼容\n"
-                f"  3. CUDA 环境正常"
-            ) from e
-    
     def init_camera_params_from_sdk(self):
         """从 SDK 初始化相机参数"""
         # RGB相机参数
@@ -276,86 +228,21 @@ class EyeDistanceSystem:
         return distance
     
     def process_frame(self, rgb_frame: np.ndarray, depth_frame: np.ndarray) -> Tuple[Optional[Dict], np.ndarray]:
-        """处理单帧"""
-        self.frame_count += 1
-        start_time = time.time()
-        
-        # 动态更新相机分辨率
-        self.update_camera_resolution(rgb_frame)
-        
-        # 检测人脸
-        detection = self.face_detector.detect_face(rgb_frame)
-        
-        if not detection:
-            return None, self.visualizer.draw_no_detection(rgb_frame.copy(), 
-                                                          "YOLO")
-        
-        # 计算距离
-        distances = []
-        eye_results = {}
-        depth_available = False
-        
-        for eye_name, eye_pos in [('left', detection['left_eye']), ('right', detection['right_eye'])]:
-            # 深度图已对齐，直接使用RGB坐标
-            depth_value = self.get_robust_depth(depth_frame, eye_pos[0], eye_pos[1])
-            
-            if depth_value:
-                coord_3d = self.pixel_to_3d(eye_pos[0], eye_pos[1], depth_value)
-                distance = self.calculate_distance_to_plane(coord_3d)
-                
-                distances.append(distance)
-                eye_results[eye_name] = {
-                    'position': eye_pos,
-                    'depth': depth_value,
-                    'coord_3d': coord_3d,
-                    'distance': distance
-                }
-                depth_available = True
-            else:
-                eye_results[eye_name] = {
-                    'position': eye_pos,
-                    'depth': None,
-                    'coord_3d': None,
-                    'distance': None
-                }
-        
-        # 处理距离
-        raw_distance = np.mean(distances) if distances else None
-        stable_distance = None
-        
-        if raw_distance:
-            stable_distance = self.distance_processor.add_measurement(raw_distance)
-        
-        # 获取稳定性评分
-        stability_score = self.distance_processor.get_stability_score()
-        
-        
-        
-        # 处理时间
-        process_time = time.time() - start_time
-        self.processing_times.append(process_time)
-        
-        # 构建结果
-        results = {
-            'frame': self.frame_count,
-            'raw_distance': raw_distance,
-            'stable_distance': stable_distance,
-            'stability_score': stability_score,
-            'eye_results': eye_results,
-            'detection': detection,
-            'process_time': process_time,
-            'fps': 1.0 / np.mean(self.processing_times) if self.processing_times else 0,
-            'depth_available': depth_available
-        }
-        
-        # 可视化
-        visualization = self.visualizer.draw_visualization(
-            rgb_frame.copy(), 
-            results,
-            "YOLO Face Model"
+        """
+        [DEPRECATED] 旧的帧处理方法，已废弃。
+
+        现在使用 DetectionOrchestrator 的 _process_with_tracker_target() 方法，
+        眼睛位置由 YOLO Pose 关键点提供，不再使用独立的人脸检测器。
+
+        Returns:
+            (None, no_detection_visualization): 始终返回无检测结果
+        """
+        logger.warning(
+            "process_frame() 已废弃，请使用 DetectionOrchestrator 模式。"
+            "眼睛位置现由 YOLO Pose 关键点提供。"
         )
-        
-        return results, visualization
+        self.frame_count += 1
+        return None, self.visualizer.draw_no_detection(rgb_frame.copy(), "DEPRECATED")
     
     def reset(self):
         """重置系统"""

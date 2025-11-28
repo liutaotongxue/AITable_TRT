@@ -59,6 +59,7 @@ class GetPose3dCoords:
         model_path: Optional[str] = None,
         confidence_threshold: float = 0.5,
         keypoint_confidence_threshold: float = DEFAULT_KEYPOINT_CONFIDENCE_THRESHOLD,
+        external_detector=None,  # 可选：外部传入的检测器（避免重复加载模型）
     ):
         """
         Initialize pose detector (TensorRT-Only)
@@ -68,43 +69,51 @@ class GetPose3dCoords:
                        If not provided, reads from system_config.json
             confidence_threshold: Detection confidence threshold [0.0, 1.0]
             keypoint_confidence_threshold: Individual keypoint confidence threshold
+            external_detector: 外部传入的检测器实例（需有 detect_keypoints 方法）
+                              如果传入，则跳过内部创建，直接使用外部检测器
         """
-        if model_path is None:
-            # Read from config (TensorRT-Only architecture)
-            from ..core.config_loader import get_config
-            config = get_config()
+        # 如果传入外部检测器，直接使用，不创建新的
+        if external_detector is not None:
+            self.detector = external_detector
+            logger.info("GetPose3dCoords: 使用外部传入的检测器（共享模型）")
+        else:
+            # 内部创建检测器
+            if model_path is None:
+                # Read from config (TensorRT-Only architecture)
+                from ..core.config_loader import get_config
+                config = get_config()
 
-            # 使用 resolve_model_path 解析模型路径（自动处理 primary/fallback）
-            resolved_path = config.resolve_model_path("yolo_pose")
+                # 使用 resolve_model_path 解析模型路径（自动处理 primary/fallback）
+                resolved_path = config.resolve_model_path("yolo_pose")
 
-            if resolved_path is None:
-                # 获取配置信息用于错误提示
-                pose_config = config.models.get("yolo_pose")
-                expected = pose_config.get("primary") if pose_config else "models/yolov8n-pose_fp16.engine"
+                if resolved_path is None:
+                    # 获取配置信息用于错误提示
+                    pose_config = config.models.get("yolo_pose")
+                    expected = pose_config.get("primary") if pose_config else "models/yolov8n-pose_fp16.engine"
+                    raise FileNotFoundError(
+                        f"YOLO Pose TensorRT engine not found.\n"
+                        f"Expected: {expected}\n"
+                        f"Please run model conversion (see docs/MODEL_CONVERSION_GUIDE.md)"
+                    )
+
+                model_path = str(resolved_path)
+
+            model_file = Path(model_path)
+            if not model_file.exists():
                 raise FileNotFoundError(
-                    f"YOLO Pose TensorRT engine not found.\n"
-                    f"Expected: {expected}\n"
-                    f"Please run model conversion (see docs/MODEL_CONVERSION_GUIDE.md)"
+                    f"YOLO Pose model file not found: {model_path}\n"
+                    f"Please provide a valid .engine file"
                 )
 
-            model_path = str(resolved_path)
-
-        model_file = Path(model_path)
-        if not model_file.exists():
-            raise FileNotFoundError(
-                f"YOLO Pose model file not found: {model_path}\n"
-                f"Please provide a valid .engine file"
-            )
-
-        try:
-            self.detector = BodyKeyPointDetector(
-                model_path=model_path,
-                confidence_threshold=confidence_threshold,
-            )
-            logger.info(f"TensorRT YOLO Pose detector initialized successfully: {model_path}")
-        except Exception as e:
-            logger.error(f"TensorRT YOLO Pose detector initialization failed: {e}")
-            raise RuntimeError(f"Pose detector initialization failed: {e}") from e
+            try:
+                self.detector = BodyKeyPointDetector(
+                    model_path=model_path,
+                    confidence_threshold=confidence_threshold,
+                )
+                logger.info(f"TensorRT YOLO Pose detector initialized successfully: {model_path}")
+            except Exception as e:
+                logger.error(f"TensorRT YOLO Pose detector initialization failed: {e}")
+                raise RuntimeError(f"Pose detector initialization failed: {e}") from e
 
         # Keypoint confidence threshold
         self.keypoint_confidence_threshold = float(keypoint_confidence_threshold)
@@ -576,3 +585,7 @@ class GetPose3dCoords:
             return {}
 
         return detection_result.get(QUALITY_FLAG_KEY, {})
+
+    # YOLO Pose method alias (preferred name for TensorRT YOLO Pose backend)
+    # PoseEngine calls this method; it delegates to detect_posture_with_mediapipe
+    detect_posture_with_yolo = detect_posture_with_mediapipe

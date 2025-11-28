@@ -92,6 +92,11 @@ class TelemetryBuilder:
         shoulder_midpoint_to_desk: Optional[float],
         frame_count: int,
         global_fps: float,
+        left_shoulder: Optional[List[float]] = None,
+        right_shoulder: Optional[List[float]] = None,
+        left_eye: Optional[List[float]] = None,
+        right_eye: Optional[List[float]] = None,
+        nose: Optional[List[float]] = None,
         async_stats: Optional[Dict[str, Any]] = None,
         camera_telemetry: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -105,6 +110,11 @@ class TelemetryBuilder:
             shoulder_midpoint_to_desk: 肩部中点到桌面的距离（米）
             frame_count: 当前帧计数
             global_fps: 全局帧率
+            left_shoulder: 左肩 3D 坐标（可选）
+            right_shoulder: 右肩 3D 坐标（可选）
+            left_eye: 左眼 3D 坐标（可选）
+            right_eye: 右眼 3D 坐标（可选）
+            nose: 鼻子 3D 坐标（可选）
             async_stats: 异步推理统计信息（可选）
             camera_telemetry: 相机恢复统计信息（可选）
 
@@ -135,12 +145,23 @@ class TelemetryBuilder:
             },
 
             # 3D 关键点坐标（左肩、右肩、左眼、右眼、鼻子、肩部中点）
+            # 优先使用直接传入的参数，否则从 results 中提取
             "keypoints_3d": {
-                "left_shoulder": results.get("pose", {}).get("keypoints_3d", {}).get("left_shoulder") if results.get("pose", {}).get("keypoints_3d") else None,
-                "right_shoulder": results.get("pose", {}).get("keypoints_3d", {}).get("right_shoulder") if results.get("pose", {}).get("keypoints_3d") else None,
-                "left_eye": results.get("pose", {}).get("keypoints_3d", {}).get("left_eye_center") if results.get("pose", {}).get("keypoints_3d") else None,
-                "right_eye": results.get("pose", {}).get("keypoints_3d", {}).get("right_eye_center") if results.get("pose", {}).get("keypoints_3d") else None,
-                "nose": results.get("pose", {}).get("keypoints_3d", {}).get("nose") if results.get("pose", {}).get("keypoints_3d") else None,
+                "left_shoulder": left_shoulder if left_shoulder is not None else (
+                    results.get("pose", {}).get("keypoints_3d", {}).get("left_shoulder") if results.get("pose", {}).get("keypoints_3d") else None
+                ),
+                "right_shoulder": right_shoulder if right_shoulder is not None else (
+                    results.get("pose", {}).get("keypoints_3d", {}).get("right_shoulder") if results.get("pose", {}).get("keypoints_3d") else None
+                ),
+                "left_eye": left_eye if left_eye is not None else (
+                    results.get("pose", {}).get("keypoints_3d", {}).get("left_eye_center") if results.get("pose", {}).get("keypoints_3d") else None
+                ),
+                "right_eye": right_eye if right_eye is not None else (
+                    results.get("pose", {}).get("keypoints_3d", {}).get("right_eye_center") if results.get("pose", {}).get("keypoints_3d") else None
+                ),
+                "nose": nose if nose is not None else (
+                    results.get("pose", {}).get("keypoints_3d", {}).get("nose") if results.get("pose", {}).get("keypoints_3d") else None
+                ),
                 "shoulder_midpoint": shoulder_midpoint,
             },
 

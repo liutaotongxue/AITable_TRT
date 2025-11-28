@@ -484,7 +484,7 @@ class TRTFaceDetector:
         Returns:
             检测结果列表，每个元素格式:
             {
-                'bbox': {'x1': float, 'y1': float, 'x2': float, 'y2': float},
+                'face_bbox': {'x1': float, 'y1': float, 'x2': float, 'y2': float},
                 'confidence': float,
                 'class_id': int,
             }
@@ -594,9 +594,9 @@ class TRTFaceDetector:
             x2 = max(0, min(x2, orig_w))
             y2 = max(0, min(y2, orig_h))
 
-            # 添加检测结果（与 SimpleFaceDetector 兼容的格式）
+            # 添加检测结果（新格式：face_bbox）
             detection_dict = {
-                'bbox': {
+                'face_bbox': {
                     'x1': x1,
                     'y1': y1,
                     'x2': x2,
@@ -674,7 +674,7 @@ class TRTFaceDetector:
         Returns:
             单个人脸检测结果，格式:
             {
-                'bbox': {'x1': int, 'y1': int, 'x2': int, 'y2': int},
+                'face_bbox': {'x1': int, 'y1': int, 'x2': int, 'y2': int},
                 'left_eye': tuple,
                 'right_eye': tuple,
                 'confidence': float,
@@ -691,14 +691,14 @@ class TRTFaceDetector:
         if len(detections) > 1:
             best_detection = max(detections, key=lambda d: (
                 # 先按面积排序
-                (d['bbox']['x2'] - d['bbox']['x1']) * (d['bbox']['y2'] - d['bbox']['y1']),
+                (d['face_bbox']['x2'] - d['face_bbox']['x1']) * (d['face_bbox']['y2'] - d['face_bbox']['y1']),
                 # 再按置信度排序
                 d['confidence']
             ))
         else:
             best_detection = detections[0]
 
-        bbox = best_detection['bbox']
+        bbox = best_detection['face_bbox']
         conf = best_detection['confidence']
 
         # 估算眼睛位置（基于人脸框）
@@ -714,7 +714,7 @@ class TRTFaceDetector:
         right_eye = (int(x1 + face_width * 0.67), int(y1 + face_height * 0.38))
 
         return {
-            'bbox': {
+            'face_bbox': {
                 'x1': int(x1),
                 'y1': int(y1),
                 'x2': int(x2),
