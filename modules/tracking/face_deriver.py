@@ -70,15 +70,14 @@ class FaceDeriver:
         person_bbox: Optional[Tuple[float, float, float, float]] = None,
     ) -> DerivedFace:
         """
-        从关键点推导人脸边界框
-        
+        From keypoints derive face bounding box.
+
         Args:
-            keypoints: 17 个关键点列表，每个元素格式：
-                {'index': int, 'x': float, 'y': float, 'confidence': float}
-            person_bbox: 人物边界框 (x1, y1, x2, y2)，用于兜底
-            
+            keypoints: list of 17 keypoints with fields {index, x, y, confidence}
+            person_bbox: person bbox (x1, y1, x2, y2); kept for API compatibility, not used for fallback in this version
+
         Returns:
-            DerivedFace 对象
+            DerivedFace result
         """
         # 提取关键点
         kps = self._extract_keypoints(keypoints)
@@ -108,10 +107,6 @@ class FaceDeriver:
             return self._derive_from_nose_shoulders(
                 nose, left_shoulder, right_shoulder
             )
-        
-        # 策略 4：使用 person_bbox 的上部作为人脸区域（兜底）
-        if person_bbox:
-            return self._derive_from_person_bbox(person_bbox)
         
         # 无法推导
         return DerivedFace(
@@ -307,7 +302,10 @@ class FaceDeriver:
         self,
         person_bbox: Tuple[float, float, float, float],
     ) -> DerivedFace:
-        """从人物边界框推导人脸区域（兜底方案）"""
+        """Derived face from person bbox (fallback)
+
+        Note: derive_face() no longer calls this method; fallback handled in orchestrator.
+        """
         x1, y1, x2, y2 = person_bbox
         
         person_width = x2 - x1

@@ -39,13 +39,14 @@ from preflight_check import preflight_check
 def print_banner():
     """打印系统信息"""
     print("\n" + "="*70)
-    print("         AI桌子智能监测系统 v3.0 - Pose-Only 架构")
-    print("         集成功能：眼距监测 + 姿态估计")
+    print("         AI桌子智能监测系统 v3.1 - Pose+Tracker 架构")
+    print("         集成功能：眼距监测 + 姿态估计 + 情绪识别 + 疲劳检测")
     print("="*70)
     print("\n TOF相机：自动读取SDK参数")
     print(" 检测模块：YOLO Pose TensorRT 加速")
     print(" 眼距计算：Pose关键点 + TOF深度")
-    print(" 情绪/疲劳：已禁用（待后续基于Pose框恢复）")
+    print(" 情绪识别：EmoNet (使用 tracker face_bbox)")
+    print(" 疲劳检测：FaceMesh (使用 tracker face_bbox)")
     print("\n操作说明：")
     print("  q - 退出系统")
     print("  s - 保存截图")
@@ -61,7 +62,7 @@ def print_banner():
 def run_orchestrator_mode(config):
     """运行 Orchestrator 异步推理模式（Pose+Tracker 路径）"""
     from modules.core.orchestrator import DetectionOrchestrator
-    from modules.engines import PoseEngine
+    from modules.engines import EmotionEngine, FatigueEngine, PoseEngine
     from modules.core.telemetry import TelemetryBuilder
     from modules.core.runtime_switch import RuntimeSwitch
 
@@ -90,11 +91,41 @@ def run_orchestrator_mode(config):
             # 初始化 TRT 检测器
             from modules.detection import TRTPoseDetector
 
-            # 情绪/疲劳模块已禁用（依赖 YOLO Face ROI，现已改用 Pose 关键点）
-            # 未来可以恢复这些模块，使用 Pose 推导的 face_bbox
+            # ========== 情绪/疲劳模块初始化（根据 features 配置开关）==========
+            features_config = config.__dict__.get('features', {}) if hasattr(config, '__dict__') else {}
+            emotion_enabled = features_config.get('emotion', {}).get('enabled', False)
+            fatigue_enabled = features_config.get('fatigue', {}).get('enabled', False)
+
             emotion_classifier = None
             fatigue_detector = None
-            logger.info("情绪/疲劳模块已禁用（Pose-based 眼距模式）")
+
+            # 情绪识别模块
+            if emotion_enabled:
+                try:
+                    from modules.emotion import EmoNetClassifier
+                    emonet_config = config.models.get('emonet', {})
+                    emonet_path = emonet_config.get('primary', 'models/emonet_fp16.engine')
+                    emotion_classifier = EmoNetClassifier(engine_path=emonet_path)
+                    logger.info(f"情绪识别模块初始化成功: {emonet_path}")
+                except Exception as e:
+                    logger.warning(f"情绪识别模块初始化失败: {e}")
+                    emotion_classifier = None
+            else:
+                logger.info("情绪识别模块已禁用（features.emotion.enabled=false）")
+
+            # 疲劳检测模块
+            if fatigue_enabled:
+                try:
+                    from modules.fatigue import FatigueDetector
+                    facemesh_config = config.models.get('facemesh', {})
+                    facemesh_path = facemesh_config.get('primary', 'models/facemesh_fp16.engine')
+                    fatigue_detector = FatigueDetector(model_path=facemesh_path)
+                    logger.info(f"疲劳检测模块初始化成功: {facemesh_path}")
+                except Exception as e:
+                    logger.warning(f"疲劳检测模块初始化失败: {e}")
+                    fatigue_detector = None
+            else:
+                logger.info("疲劳检测模块已禁用（features.fatigue.enabled=false）")
 
             # 姿态检测器
             pose_config = config.models.get('yolo_pose', {})
@@ -118,9 +149,25 @@ def run_orchestrator_mode(config):
             # 创建引擎
             engine_config = config.performance.async_inference.get('engine_config', {})
 
-            # 情绪/疲劳引擎已禁用（YOLO Face 已移除）
+            # 情绪引擎（使用 tracker 的 face_bbox）
             emotion_engine = None
+            if emotion_classifier is not None:
+                emotion_engine = EmotionEngine(
+                    classifier=emotion_classifier,
+                    interval_frames=engine_config.get('emotion', {}).get('interval_frames', 10),
+                    cache_timeout=engine_config.get('emotion', {}).get('cache_timeout', 4.0),
+                    latency_smoothing=engine_config.get('emotion', {}).get('latency_smoothing', 0.7)
+                )
+                logger.info("EmotionEngine 初始化成功")
+
+            # 疲劳引擎（使用 tracker 的 face_bbox）
             fatigue_engine = None
+            if fatigue_detector is not None:
+                fatigue_engine = FatigueEngine(
+                    detector=fatigue_detector,
+                    latency_smoothing=engine_config.get('fatigue', {}).get('latency_smoothing', 0.7)
+                )
+                logger.info("FatigueEngine 初始化成功")
 
             # PoseEngine 正确初始化：使用外部检测器避免重复加载模型
             from modules.pose import GetPose3dCoords, HeadOrientationFilter
@@ -139,24 +186,22 @@ def run_orchestrator_mode(config):
             )
             logger.info("PoseEngine 初始化成功（共享检测器）")
 
-            # 创建 Orchestrator
-            ui_enabled_env = os.getenv("AITABLE_ENABLE_UI", "1") == "1"
-            window_manager = None
-            if ui_enabled_env:
-                from modules.ui import WindowManager
-                window_manager = WindowManager(
-                    title='AI Table Monitor - Orchestrator Mode',
-                    width=960
-                )
-                logger.info("UI 模式: 已启用（窗口标题: AI Table Monitor - Orchestrator Mode）")
+            # Orchestrator
+            ui_enabled_env = os.getenv("AITABLE_ENABLE_UI", "0") == "1"
+            from modules.ui import WindowManager
+            window_manager = WindowManager(
+                title='AI Table Monitor - Orchestrator Mode',
+                width=960
+            )
+            if not ui_enabled_env:
+                window_manager.disable()
+                logger.info("UI 模式: 默认关闭 (AITABLE_ENABLE_UI=0)，可按 'v' 运行时开启。")
             else:
-                logger.info("UI 模式: 已禁用（AITABLE_ENABLE_UI=0，使用无头模式）")
+                logger.info("UI 模式: 已启用，窗口标题: AI Table Monitor - Orchestrator Mode。")
 
-            # 可视化热切换开关（按键 'v'），仅在 UI 启用时创建并绑定
-            visual_switch = None
-            if window_manager:
-                visual_switch = RuntimeSwitch(initial=True, name="UI显示")
-                window_manager.bind_runtime_switch(visual_switch)
+            # 可视化开关（允许按 'v' 运行时切换 UI 显示）
+            visual_switch = RuntimeSwitch(initial=ui_enabled_env, name="UI显示")
+            window_manager.bind_runtime_switch(visual_switch)
 
             orchestrator = DetectionOrchestrator(
                 system=system,

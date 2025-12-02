@@ -132,6 +132,15 @@ class DetectionOrchestrator:
             )
 
         tracking_cfg = self.system_config.get('tracking', {})
+        target_sel_cfg = self.system_config.get('target_selection', {})
+
+        # 获取相机内参（用于 3D 肩部距离选人）
+        camera_intrinsics = None
+        if hasattr(self.system, 'intrinsics_manager') and self.system.intrinsics_manager:
+            camera_intrinsics = self.system.intrinsics_manager.get_rgb_intrinsics_dict()
+            logger.info(f"Camera intrinsics loaded: fx={camera_intrinsics.get('fx'):.1f}, "
+                       f"fy={camera_intrinsics.get('fy'):.1f}")
+
         try:
             self.tracker = SimpleTracker(
                 depth_range_mm=(
@@ -140,8 +149,16 @@ class DetectionOrchestrator:
                 ),
                 switch_depth_delta_mm=tracking_cfg.get('switch_depth_delta_mm', 100),
                 min_keep_frames=tracking_cfg.get('min_keep_frames', 15),
+                # 3D 选人参数
+                camera_intrinsics=camera_intrinsics,
+                distance_range_m=(
+                    target_sel_cfg.get('distance_min_m', 0.3),
+                    target_sel_cfg.get('distance_max_m', 1.5)
+                ),
+                switch_distance_delta_m=target_sel_cfg.get('epsilon_m', 0.05),
+                switch_hold_frames=target_sel_cfg.get('switch_frames', 8),
             )
-            logger.info("SimpleTracker 初始化成功（Pose+Tracker 模式）")
+            logger.info("SimpleTracker 初始化成功（3D 肩部距离选人模式）")
         except Exception as e:
             raise RuntimeError(f"SimpleTracker 初始化失败: {e}")
         # ==========================================
@@ -191,14 +208,21 @@ class DetectionOrchestrator:
             self.HEARTBEAT_INTERVAL = self.config_manager.get_int('system.heartbeat_interval')
         else:
             # 回退到环境变量
-            self.UI_ENABLED = os.getenv("AITABLE_ENABLE_UI", "1") == "1"
+            self.UI_ENABLED = os.getenv("AITABLE_ENABLE_UI", "0") == "1"
             self.STAY_OPEN = os.getenv("AITABLE_STAY_OPEN", "1") == "1"
             self.HEARTBEAT_INTERVAL = 150
 
         # 注意：去抖阈值、空帧计数等已移至 WindowManager 管理
 
+        # ========== 目标选择器初始化（禁用 NearestPersonSelector）==========
+        # 选人完全依赖 SimpleTracker 内置的 3D 肩部距离逻辑
+        target_sel_cfg = self.system_config.get('target_selection', {})
+        self.target_selector_enabled = False
+        self.target_selector = None
+
         logger.info("DetectionOrchestrator: 已初始化（Pose+Tracker 模式）")
         logger.info("  - 追踪模式: 强制启用（face-only 已移除）")
+        logger.info("  - 目标选择器: SimpleTracker 内置 3D 肩部距离选人")
         logger.info(f"  - 情绪检测: {'启用' if emotion_engine else '禁用'}")
         logger.info(f"  - 疲劳检测: {'启用' if fatigue_engine else '禁用'}")
         logger.info(f"  - 姿态检测: {'启用' if pose_engine else '禁用'}")
@@ -334,30 +358,38 @@ class DetectionOrchestrator:
                     else:
                         self.tracker.update([], depth_frame)
 
+                    # 目标选择：完全使用 SimpleTracker 内置的 3D 肩部距离逻辑
                     target = self.tracker.get_primary_target()
 
                     if target:
-                        current_face_detected = True
-                        face_appeared = not self.previous_face_detected
+                        # 只有有可靠脸框时才认为有 face
+                        has_valid_face = bool(target.face_valid and target.face_bbox)
+                        current_face_detected = has_valid_face
+                        face_appeared = has_valid_face and (not self.previous_face_detected)
 
                         results, vis_from_system = self._process_with_tracker_target(
                             target, rgb_frame, depth_frame
                         )
 
-                        # 从 tracker 获取 face_bbox（用于情绪/疲劳 ROI）
+                        # 从 tracker 获取 face_bbox（用于情绪/疲劳 ROI），无兜底
                         if target.face_valid and target.face_bbox:
                             x1, y1, x2, y2 = target.face_bbox
-                            face_bbox = {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y2)}
-                        elif target.bbox:
-                            # 从人体框估算头部区域
-                            x1, y1, x2, y2 = target.bbox
-                            head_h = (y2 - y1) / 6
-                            face_bbox = {'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y1 + head_h)}
+                            face_bbox = {
+                                'x1': int(x1),
+                                'y1': int(y1),
+                                'x2': int(x2),
+                                'y2': int(y2)
+                            }
 
                         # 从 target 获取 person_bbox（用于 PoseEngine 计算 3D 坐标和姿态角度）
                         if target.bbox:
                             px1, py1, px2, py2 = target.bbox
-                            person_bbox = {'x1': int(px1), 'y1': int(py1), 'x2': int(px2), 'y2': int(py2)}
+                            person_bbox = {
+                                'x1': int(px1),
+                                'y1': int(py1),
+                                'x2': int(px2),
+                                'y2': int(py2)
+                            }
 
                         # 使用 ROIManager 提取 face_roi 和 person_roi
                         # PoseEngine 需要 person_roi（RegionROI 对象）来计算 3D 坐标
@@ -522,13 +554,33 @@ class DetectionOrchestrator:
                                 logger.info(f"[DEBUG pose_results] frame={self.system.frame_count} | pose_results=None")
 
                         # 添加原始 pose 检测结果（用于骨架绘制）
-                        # pose_raw 包含 TRTPoseDetector 的 2D keypoints，visualizer 需要这些数据画骨架
-                        if pose_raw and pose_raw.get('detections'):
+                        # 只传递当前目标的 pose 检测，避免多人场景下画错骨架
+                        # 同时用 pose detection 的框覆写 detection.person_bbox，保证可视化框和骨架一致
+                        if pose_raw and pose_raw.get('detections') and target:
                             if results is None:
                                 results = {}
                             if results.get('pose') is None:
                                 results['pose'] = {}
-                            results['pose']['detections'] = pose_raw['detections']
+                            # 从所有检测中找到匹配当前 target 的那个
+                            matching_det = self._find_matching_pose_for_target(
+                                target, pose_raw['detections']
+                            )
+                            if matching_det:
+                                # 1）只保留当前目标的 pose detection，供可视化画骨架
+                                results['pose']['detections'] = [matching_det]
+                                # 2）用 pose 的框覆写 detection.person_bbox，让大框和骨架对齐
+                                pose_bbox = matching_det.get('bbox')
+                                detection = results.get('detection')
+                                if pose_bbox and detection:
+                                    detection['person_bbox'] = {
+                                        'x1': int(pose_bbox.get('x1', 0)),
+                                        'y1': int(pose_bbox.get('y1', 0)),
+                                        'x2': int(pose_bbox.get('x2', 0)),
+                                        'y2': int(pose_bbox.get('y2', 0)),
+                                    }
+                            else:
+                                # 没有匹配的 pose detection 时，清空 pose 可视化
+                                results['pose']['detections'] = []
 
                         # 添加全局和相机 FPS
                         if results is None:
@@ -578,8 +630,12 @@ class DetectionOrchestrator:
                             )
                             results['telemetry'] = telemetry
 
-                        # 可视化
-                        if (emotion_results is not None) or (fatigue_results is not None and fatigue_results.get('enabled', False)):
+                        # 可视化：只要姿态/情绪/疲劳有任一结果，就重新渲染一次，确保骨架连线显示
+                        if (
+                            (emotion_results is not None)
+                            or (fatigue_results is not None and fatigue_results.get('enabled', False))
+                            or (pose_results is not None)
+                        ):
                             if self.fatigue_engine and fatigue_results and fatigue_results.get('enabled', False):
                                 self.visualization = self.system.visualizer.draw_combined_visualization(
                                     rgb_frame.copy(), results, self.fatigue_engine.detector
@@ -796,6 +852,88 @@ class DetectionOrchestrator:
         visualization = self.system.visualizer.draw_visualization(rgb_frame.copy(), results, "Pose Tracker")
         return results, visualization
 
+    def _find_matching_pose_for_target(self, target, detections):
+        """
+        Find the pose detection that best matches the current target.
+
+        Uses IoU (Intersection over Union) between target's person bbox
+        and each detection's bbox to find the best match.
+
+        Args:
+            target: TrackedPerson object with bbox attribute
+            detections: List of pose detections from TRTPoseDetector
+
+        Returns:
+            Best matching detection dict, or None if no good match
+        """
+        if not target or not target.bbox or not detections:
+            return None
+
+        # Target bbox: (x1, y1, x2, y2)
+        tx1, ty1, tx2, ty2 = target.bbox
+
+        best_det = None
+        best_iou = 0.0
+        IOU_THRESHOLD = 0.2  # Minimum IoU to be considered a match (lowered for better matching)
+
+        for det in detections:
+            det_bbox = det.get('bbox', {})
+            if not det_bbox:
+                continue
+
+            # Detection bbox
+            dx1 = det_bbox.get('x1', 0)
+            dy1 = det_bbox.get('y1', 0)
+            dx2 = det_bbox.get('x2', 0)
+            dy2 = det_bbox.get('y2', 0)
+
+            # Calculate IoU
+            inter_x1 = max(tx1, dx1)
+            inter_y1 = max(ty1, dy1)
+            inter_x2 = min(tx2, dx2)
+            inter_y2 = min(ty2, dy2)
+
+            inter_w = max(0, inter_x2 - inter_x1)
+            inter_h = max(0, inter_y2 - inter_y1)
+            inter_area = inter_w * inter_h
+
+            if inter_area == 0:
+                continue
+
+            area_t = (tx2 - tx1) * (ty2 - ty1)
+            area_d = (dx2 - dx1) * (dy2 - dy1)
+            union_area = area_t + area_d - inter_area
+
+            if union_area <= 0:
+                continue
+
+            iou = inter_area / union_area
+
+            if iou > best_iou:
+                best_iou = iou
+                best_det = det
+
+        # Only return if IoU exceeds threshold
+        if best_iou >= IOU_THRESHOLD:
+            return best_det
+
+        # Debug log when no match found (pose detected but IoU too low)
+        # In this case, visualizer will use tracker's bbox (fallback), skeleton won't be drawn
+        if detections and best_iou > 0:
+            logger.debug(
+                f"[PoseMatch] No match (fallback to tracker bbox): "
+                f"target_id={target.track_id} target_bbox={target.bbox}, "
+                f"best_iou={best_iou:.2f} < {IOU_THRESHOLD}, "
+                f"pose_detections={len(detections)}"
+            )
+        elif detections:
+            logger.debug(
+                f"[PoseMatch] No overlap: target_id={target.track_id} "
+                f"target_bbox={target.bbox}, pose_detections={len(detections)}"
+            )
+
+        return None
+
     def cleanup(self):
         """清理资源"""
         # 停止异步推理调度器
@@ -848,6 +986,7 @@ class DetectionOrchestrator:
 
         stats['global_fps'] = self.global_fps
 
+        # 添加目标选择器统计
         # 添加异步推理统计
         if self.inference_scheduler:
             stats['async_inference'] = self.inference_scheduler.get_stats()

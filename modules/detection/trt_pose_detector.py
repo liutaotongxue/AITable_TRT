@@ -247,32 +247,32 @@ class TRTPoseDetector:
         - 如果已有 CUDA 上下文（如 PyTorch 创建），则复用
         """
         try:
-            # 尝试初始化 CUDA
+            # ????? CUDA
             cuda.init()
 
-            # 检查是否已有上下文
+            # ?????????
             try:
                 current_ctx = cuda.Context.get_current()
                 if current_ctx:
-                    logger.info("检测到已存在的 CUDA 上下文，复用")
+                    logger.info("??????? CUDA ??????")
                     self.cuda_ctx = current_ctx
                     self._owns_cuda_context = False
                     return
             except cuda.LogicError:
-                # 无当前上下文，创建新的
+                # ???????????
                 pass
 
-            # 创建新的 CUDA 上下文
+            # ???????retain_primary_context??????????????
             device = cuda.Device(0)
-            self.cuda_ctx = device.make_context()
+            self.cuda_ctx = device.retain_primary_context()
+            self.cuda_ctx.push()
             self._owns_cuda_context = True
-            logger.info("创建新的 CUDA 上下文（设备 0）")
+            logger.info("??? CUDA ????retain_primary_context??? 0?")
 
         except Exception as e:
-            logger.warning(f"CUDA 上下文初始化失败: {e}，尝试继续（可能依赖现有上下文）")
+            logger.warning(f"CUDA ????????: {e}?????????")
             self.cuda_ctx = None
             self._owns_cuda_context = False
-
     def _load_engine(self):
         """加载 TensorRT 引擎并创建执行上下文"""
         engine_file = Path(self.engine_path)

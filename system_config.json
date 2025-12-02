@@ -53,7 +53,7 @@
       "fallback": [
         "models/yolov8n-pose_fp32.engine"
       ],
-      "confidence_threshold": 0.5,
+      "confidence_threshold": 0.65,
       "iou_threshold": 0.45,
       "required": true,
       "description": "TensorRT-Only",
@@ -80,6 +80,34 @@
     "depth_range_max": 1500,
     "switch_depth_delta_mm": 100,
     "min_keep_frames": 15
+  },
+  "features": {
+    "emotion": {
+      "enabled": true,
+      "description": "emotion module (uses tracker face_bbox)"
+    },
+    "fatigue": {
+      "enabled": true,
+      "description": "fatigue module (uses tracker face_bbox)"
+    }
+  },
+  "target_selection": {
+    "enabled": false,
+    "description": "Multi-person target selection based on shoulder midpoint distance",
+    "distance_min_m": 0.4,
+    "distance_max_m": 1.5,
+    "confidence_min": 0.8,
+    "switch_time_ms": 1000,
+    "switch_frames": 8,
+    "use_time_threshold": true,
+    "lost_time_ms": 500,
+    "lost_frames": 5,
+    "epsilon_m": 0.08,
+    "current_bonus_m": 0.03,
+    "center_bias": true,
+    "center_weight": 0.02,
+    "log_switches": true,
+    "log_candidates": true
   },
   "desk_plane": {
     "camera_height_m": 0.3,
@@ -140,7 +168,7 @@
           "latency_smoothing": 0.7
         },
         "pose": {
-          "interval_frames": 10,
+          "interval_frames": 1,
           "cache_timeout": 1.0,
           "latency_smoothing": 0.7,
           "include_full_3d_coords": true

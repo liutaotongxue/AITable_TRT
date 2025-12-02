@@ -670,51 +670,51 @@ class EnhancedVisualizer:
 
     def _draw_pose_angles_panel(self, image: np.ndarray, angles: Dict):
         """
-        绘制姿态角度信息面板
+        Draw posture angle info panel (bottom-left).
 
-        参数:
-            image: 输入图像
-            angles: 角度字典 {head_forward_angle, shoulder_tilt_angle, head_roll_angle}
+        Args:
+            image: Input frame
+            angles: Dict with keys {head_forward_angle, shoulder_tilt_angle, head_roll_angle}
         """
         h, w = image.shape[:2]
 
-        # 面板位置 - 左下角
+        # Panel position - bottom-left
         panel_x = 20
         panel_y = h - 200
         panel_width = 280
         panel_height = 180
 
-        # 绘制半透明背景
+        # Translucent background
         overlay = image.copy()
         cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_width, panel_y + panel_height),
                      (40, 40, 40), -1)
         cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
 
-        # 面板标题
-        cv2.putText(image, "Posture Angles", (panel_x + 10, panel_y + 30),
+        # Title
+        cv2.putText(image, 'Posture Angles', (panel_x + 10, panel_y + 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-        # 分隔线
+        # Divider
         cv2.line(image, (panel_x, panel_y + 40), (panel_x + panel_width, panel_y + 40), (60, 60, 60), 1)
 
-        # 角度信息
+        # Angles
         y_offset = panel_y + 70
         angle_items = [
-            ('Forward', angles.get('head_forward_angle'), '°'),
-            ('Shoulder Tilt', angles.get('shoulder_tilt_angle'), '°'),
-            ('Head Roll', angles.get('head_roll_angle'), '°')
+            ('Forward', angles.get('head_forward_angle'), 'deg'),
+            ('Shoulder Tilt', angles.get('shoulder_tilt_angle'), 'deg'),
+            ('Head Roll', angles.get('head_roll_angle'), 'deg')
         ]
 
         for label, value, unit in angle_items:
             if value is not None:
-                # 根据角度值选择颜色
+                # Color by magnitude
                 abs_val = abs(value)
                 if abs_val < 10:
-                    color = (0, 255, 0)  # 绿色 - 正常
+                    color = (0, 255, 0)  # green - good
                 elif abs_val < 20:
-                    color = (0, 255, 255)  # 黄色 - 轻微
+                    color = (0, 255, 255)  # yellow - mild
                 else:
-                    color = (0, 0, 255)  # 红色 - 警告
+                    color = (0, 0, 255)  # red - caution
 
                 text = f"{label}: {value:+.1f}{unit}"
             else:
@@ -722,9 +722,8 @@ class EnhancedVisualizer:
                 text = f"{label}: N/A"
 
             cv2.putText(image, text, (panel_x + 15, y_offset),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             y_offset += 35
-
     def draw_fatigue_info(self, image: np.ndarray, fatigue: Dict, detection: Dict):
         """
         绘制疲劳检测结果信息面板
